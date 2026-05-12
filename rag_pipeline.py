@@ -18,8 +18,8 @@ from gemini_patch import generate_content_with_model_fallback
 # GEMINI CLIENT
 # ======================================================
 
-API_KEY = os.getenv("GEMINI_API_KEY")
-client = genai.Client(api_key=API_KEY)
+API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("API_KEY")
+client = genai.Client(api_key=API_KEY) if API_KEY else None
 LAST_EXTRACTION_SUMMARY = {}
 PBIX_ANALYSIS_SECTION_KEYS = (
     "overall_performance_summary",
@@ -1394,6 +1394,27 @@ Return JSON only.
         max_retries = 3
         import time
 
+        if not API_KEY or client is None:
+            if chart_intent:
+                return {
+                    "answer": "Gemini API key is not configured in this environment, so AI chart insights are temporarily unavailable.",
+                    "insights": [],
+                    "key_insights_and_drivers": [],
+                    "risks_and_issues": [],
+                    "data_driven_recommendations": [],
+                    "overall_performance_summary": "",
+                    "chart": None,
+                }
+            return {
+                "answer": "Gemini API key is not configured in this environment, so AI-generated analysis is temporarily unavailable.",
+                "insights": [],
+                "key_insights_and_drivers": [],
+                "risks_and_issues": [],
+                "data_driven_recommendations": [],
+                "overall_performance_summary": "",
+                "text": "",
+            }
+
         for attempt in range(max_retries):
             try:
                 response = generate_content_with_model_fallback(
@@ -1489,6 +1510,8 @@ Do not return JSON, just return professional formatting in markdown.
 
     max_retries = 3
     import time
+    if client is None or not API_KEY:
+        return "Gemini API key is not configured in this environment, so the unified report could not be generated."
     for attempt in range(max_retries):
         try:
             response = client.models.generate_content(

@@ -25,7 +25,8 @@ load_dotenv(override=True)
 # ---------------------------
 # Initialize Gemini Client
 # ---------------------------
-gemini_client = genai.Client()
+_GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("API_KEY")
+gemini_client = genai.Client(api_key=_GEMINI_API_KEY) if _GEMINI_API_KEY else None
 GEMINI_MODEL = "gemini-2.5-flash"
 
 GENERIC_QUERY_TOKENS = {
@@ -407,6 +408,8 @@ def _finalize_chart_config(user_msg: str, df: pd.DataFrame, cfg_dict: Dict[str, 
 def _gemini_invoke(prompt: str) -> str:
     """Helper to invoke Gemini and return the text response, with retry for rate limits."""
     import time
+    if gemini_client is None:
+        return "Gemini API key is not configured in this environment, so AI-generated dataset analysis is temporarily unavailable."
     max_retries = 4
     for attempt in range(max_retries):
         try:
