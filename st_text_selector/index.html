@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <script>
+      function sendMessageToStreamlitClient(type, data) {
+          const outData = Object.assign({isStreamlitMessage: true, type: type}, data)
+          window.parent.postMessage(outData, "*")
+      }
+      
+      const Streamlit = {
+          setFrameHeight: function(height) {
+              sendMessageToStreamlitClient("streamlit:setFrameHeight", {height: height})
+          },
+          setComponentValue: function(value) {
+              sendMessageToStreamlitClient("streamlit:setComponentValue", {value: value, dataType: "json"})
+          },
+          setComponentReady: function() {
+              sendMessageToStreamlitClient("streamlit:componentReady", {apiVersion: 1})
+          }
+      }
+      
+      window.onload = function() {
+          Streamlit.setComponentReady();
+          Streamlit.setFrameHeight(0);
+          
+          try {
+              // Now we listen to right-click (contextmenu)
+              window.parent.document.addEventListener('contextmenu', function(e) {
+                  let selection = window.parent.getSelection().toString();
+                  if(selection && selection.trim().length > 0) {
+                      // Prevent standard right click menu when text is selected
+                      e.preventDefault(); 
+                      // Send data AND timestamp so we can pop the dialog multiple times
+                      Streamlit.setComponentValue({
+                          text: selection.trim(), 
+                          timestamp: Date.now()
+                      });
+                  }
+              });
+          } catch(e) {
+              // Ignore cross-origin errors if any
+          }
+      }
+    </script>
+  </head>
+  <body></body>
+</html>
