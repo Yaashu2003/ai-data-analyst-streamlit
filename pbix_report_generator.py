@@ -305,13 +305,14 @@ def build_context(charts):
             data_sample += f"\n- Categories (X-Axis): {x_sample}"
 
         metadata_note = ""
+        data_sample_text = data_sample or "\n- No numeric sample available from the PBIX file."
 
         context.append(f"""
 Chart Title: {title}
 Chart Type: {chart_type}
 Page: {page}
 Data Availability: {"Embedded chart data available" if data_available else "Layout only / no embedded chart data"}
-Data Sample:{data_sample if data_sample else "\n- No numeric sample available from the PBIX file."}
+Data Sample:{data_sample_text}
 {metadata_note}
 
 Interpretation Hint:
