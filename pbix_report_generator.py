@@ -3,7 +3,23 @@ import os
 import re
 from google import genai
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("API_KEY")
+
+def _resolve_gemini_api_key():
+    key = os.getenv("GEMINI_API_KEY") or os.getenv("API_KEY")
+    if key:
+        return key
+
+    try:
+        import streamlit as st
+
+        key = st.secrets.get("GEMINI_API_KEY") or st.secrets.get("API_KEY")
+        if key:
+            os.environ.setdefault("GEMINI_API_KEY", str(key))
+            return str(key)
+    except Exception:
+        pass
+
+    return None
 
 
 def _chart_priority(chart):
@@ -329,12 +345,14 @@ Interpretation Hint:
 # GENERATE REPORT (FIXED)
 # -------------------------
 def generate_pbix_report(charts):
-    if not GEMINI_API_KEY:
+    gemini_api_key = _resolve_gemini_api_key()
+
+    if not gemini_api_key:
         print("Gemini API key not configured. Using local PBIX report synthesis.")
         return _build_local_pbix_report(charts)
 
     try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
+        client = genai.Client(api_key=gemini_api_key)
     except Exception as exc:
         print(f"Gemini PBIX client initialization failed: {exc}. Using local PBIX report synthesis.")
         return _build_local_pbix_report(charts)
