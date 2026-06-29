@@ -1,47 +1,229 @@
 <!DOCTYPE html>
 <html>
   <head>
-    <script>
-      function sendMessageToStreamlitClient(type, data) {
-          const outData = Object.assign({isStreamlitMessage: true, type: type}, data)
-          window.parent.postMessage(outData, "*")
+    <style>
+      html, body {
+        margin: 0;
+        padding: 0;
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: transparent;
+        font-family: Arial, sans-serif;
       }
-      
-      const Streamlit = {
+      #report-root {
+        width: 100%;
+        box-sizing: border-box;
+        overflow: auto;
+      }
+      #report-root .container {
+        margin-top: 0 !important;
+        margin-bottom: 0 !important;
+      }
+
+      /* Editable region styling */
+      [contenteditable="true"] {
+        outline: none;
+        border-radius: 3px;
+        transition: box-shadow 0.15s ease;
+        min-height: 1em;
+      }
+      [contenteditable="true"]:focus {
+        box-shadow: 0 0 0 2px rgba(79, 70, 229, 0.4);
+        outline: none;
+        background: rgba(79, 70, 229, 0.04);
+      }
+      [contenteditable="true"]:hover:not(:focus) {
+        box-shadow: 0 0 0 1px rgba(79, 70, 229, 0.2);
+        cursor: text;
+      }
+
+      /* Thin edit-mode hint bar at top */
+      #edit-hint {
+        position: sticky;
+        top: 0;
+        z-index: 100;
+        background: linear-gradient(90deg, #4f46e5 0%, #7c3aed 100%);
+        color: #fff;
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.04em;
+        padding: 5px 14px;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+      #edit-hint span { opacity: 0.82; font-weight: 400; }
+      #save-badge {
+        margin-left: auto;
+        background: rgba(255,255,255,0.2);
+        border-radius: 20px;
+        padding: 2px 10px;
+        font-size: 10px;
+        opacity: 0;
+        transition: opacity 0.4s;
+      }
+      #save-badge.show { opacity: 1; }
+    </style>
+    <script>
+      let renderedReport = false;
+      let debounceTimer = null;
+
+      function sendMessageToStreamlitClient(type, data) {
+          var outData = Object.assign({isStreamlitMessage: true, type: type}, data);
+          window.parent.postMessage(outData, "*");
+      }
+
+      var Streamlit = {
           setFrameHeight: function(height) {
-              sendMessageToStreamlitClient("streamlit:setFrameHeight", {height: height})
+              sendMessageToStreamlitClient("streamlit:setFrameHeight", {height: height});
           },
           setComponentValue: function(value) {
-              sendMessageToStreamlitClient("streamlit:setComponentValue", {value: value, dataType: "json"})
+              sendMessageToStreamlitClient("streamlit:setComponentValue", {value: value, dataType: "json"});
           },
           setComponentReady: function() {
-              sendMessageToStreamlitClient("streamlit:componentReady", {apiVersion: 1})
+              sendMessageToStreamlitClient("streamlit:componentReady", {apiVersion: 1});
           }
+      };
+
+      function selectedTextFromCurrentDocument() {
+          var selection = window.getSelection ? window.getSelection() : null;
+          return selection ? selection.toString().trim() : "";
       }
-      
+
+      function sendSelectedText(text) {
+          if (!text || !text.trim()) return;
+          Streamlit.setComponentValue({
+              type: "selection",
+              text: text.trim(),
+              timestamp: Date.now()
+          });
+      }
+
+      function showSaved() {
+          var badge = document.getElementById("save-badge");
+          if (!badge) return;
+          badge.textContent = "✓ Saved";
+          badge.classList.add("show");
+          if (badge._hideTimer) clearTimeout(badge._hideTimer);
+          badge._hideTimer = setTimeout(function() { badge.classList.remove("show"); }, 1800);
+      }
+
+      function collectEditedText(root) {
+          var parts = [];
+          root.querySelectorAll("[contenteditable='true']").forEach(function(el) {
+              var text = el.innerText ? el.innerText.trim() : "";
+              if (text) parts.push(text);
+          });
+          return parts.join("\n\n");
+      }
+
+      function sendEditedText(root) {
+          var text = collectEditedText(root);
+          Streamlit.setComponentValue({
+              type: "edit",
+              edited_text: text,
+              edit_timestamp: Date.now()
+          });
+          showSaved();
+      }
+
+      function makeContentEditable(root) {
+          var editableSelectors = [
+              "p", "li", "h1", "h2", "h3", "h4", "h5", "h6",
+              ".key-summary-text", ".body-insights-header", "td", "th"
+          ];
+          editableSelectors.forEach(function(sel) {
+              root.querySelectorAll(sel).forEach(function(el) {
+                  if (el.closest("iframe")) return;
+                  el.setAttribute("contenteditable", "true");
+                  el.setAttribute("spellcheck", "true");
+
+                  el.addEventListener("input", function() {
+                      clearTimeout(debounceTimer);
+                      debounceTimer = setTimeout(function() {
+                          sendEditedText(root);
+                      }, 800);
+                  });
+
+                  // Enter key inserts line break instead of new block
+                  el.addEventListener("keydown", function(e) {
+                      if (e.key === "Enter" && !e.shiftKey) {
+                          e.preventDefault();
+                          document.execCommand("insertLineBreak");
+                      }
+                  });
+              });
+          });
+      }
+
+      function renderReportHtml(html, height) {
+          var root = document.getElementById("report-root");
+          if (!root || !html) return;
+
+          var parser = new DOMParser();
+          var doc = parser.parseFromString(html, "text/html");
+          root.innerHTML = "";
+
+          doc.head.querySelectorAll("style, link[rel='stylesheet']").forEach(function(node) {
+              root.appendChild(node.cloneNode(true));
+          });
+
+          var reportBody = document.createElement("div");
+          reportBody.innerHTML = doc.body ? doc.body.innerHTML : html;
+          root.appendChild(reportBody);
+
+          makeContentEditable(root);
+
+          root.style.height = (height || 900) + "px";
+          Streamlit.setFrameHeight(height || 900);
+          renderedReport = true;
+      }
+
+      window.addEventListener("message", function(event) {
+          var data = event.data || {};
+          if (data.type !== "streamlit:render") return;
+          var args = data.args || {};
+          if (args.html) {
+              renderReportHtml(args.html, args.height || 900);
+          } else if (!renderedReport) {
+              Streamlit.setFrameHeight(0);
+          }
+      });
+
       window.onload = function() {
           Streamlit.setComponentReady();
           Streamlit.setFrameHeight(0);
-          
+
+          // Right-click on selected text -> send for sentence feedback
+          document.addEventListener("contextmenu", function(e) {
+              var selection = selectedTextFromCurrentDocument();
+              if (selection && selection.trim().length > 0) {
+                  e.preventDefault();
+                  sendSelectedText(selection);
+              }
+          });
+
           try {
-              // Now we listen to right-click (contextmenu)
-              window.parent.document.addEventListener('contextmenu', function(e) {
-                  let selection = window.parent.getSelection().toString();
-                  if(selection && selection.trim().length > 0) {
-                      // Prevent standard right click menu when text is selected
-                      e.preventDefault(); 
-                      // Send data AND timestamp so we can pop the dialog multiple times
-                      Streamlit.setComponentValue({
-                          text: selection.trim(), 
-                          timestamp: Date.now()
-                      });
+              window.parent.document.addEventListener("contextmenu", function(e) {
+                  var selection = window.parent.getSelection().toString();
+                  if (selection && selection.trim().length > 0) {
+                      e.preventDefault();
+                      sendSelectedText(selection);
                   }
               });
           } catch(e) {
-              // Ignore cross-origin errors if any
+              // Ignore cross-origin errors
           }
-      }
+      };
     </script>
   </head>
-  <body></body>
+  <body>
+    <div id="edit-hint">
+      &#9998;&nbsp; Click any text to edit it directly &nbsp;
+      <span>| Right-click selected text to add sentence feedback</span>
+      <div id="save-badge"></div>
+    </div>
+    <div id="report-root"></div>
+  </body>
 </html>

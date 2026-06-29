@@ -1,5 +1,6 @@
 import gemini_patch
 import io
+import json
 import os
 import shutil
 import subprocess
@@ -35,10 +36,15 @@ BASE_DIR = Path(__file__).resolve().parent
 SUPERSTORE_CSV = BASE_DIR / "Superstore.csv"
 ANALYSIS_SCRIPT = BASE_DIR / "main.py"
 REPORT_HTML = BASE_DIR / "interactive_analysis_report.html"
+DATASET_INPUT_DIR = BASE_DIR / "dataset_input"
+DATASET_INPUT_DIR.mkdir(exist_ok=True)
+DATASET_MANIFEST = DATASET_INPUT_DIR / "manifest.json"
 REPORT_INPUT_DIR = BASE_DIR / "report_input"
 REPORT_INPUT_DIR.mkdir(exist_ok=True)
 REPORT_EXPORT_INPUT_DIR = BASE_DIR / "report_input_exports"
 REPORT_EXPORT_INPUT_DIR.mkdir(exist_ok=True)
+DATASET_SOURCE_COLUMN = "source_file"
+DATASET_ROW_COLUMN = "source_row_number"
 
 
 if "mode" not in st.session_state:
@@ -61,6 +67,12 @@ if "analysis_report_loaded" not in st.session_state:
     st.session_state.analysis_report_loaded = False
 if "pbix_extraction_summary" not in st.session_state:
     st.session_state.pbix_extraction_summary = {}
+if "dataset_upload_signature" not in st.session_state:
+    st.session_state.dataset_upload_signature = None
+if "dataset_upload_summary" not in st.session_state:
+    st.session_state.dataset_upload_summary = {}
+if "dataset_preview" not in st.session_state:
+    st.session_state.dataset_preview = pd.DataFrame()
 
 
 if "initial_cleanup" not in st.session_state:
@@ -91,6 +103,7 @@ def clear_folder(folder: Path):
 
 def split_uploaded_files(files):
     pbix_files = []
+    tableau_files = []
     export_files = []
     dataset_files = []
 
@@ -98,11 +111,13 @@ def split_uploaded_files(files):
         suffix = Path(file.name).suffix.lower()
         if suffix == ".pbix":
             pbix_files.append(file)
+        elif suffix in {".twb", ".twbx"}:
+            tableau_files.append(file)
         elif suffix in {".csv", ".xlsx", ".xls"}:
             export_files.append(file)
             dataset_files.append(file)
 
-    return pbix_files, export_files, dataset_files
+    return pbix_files, tableau_files, export_files, dataset_files
 
 
 def save_uploaded_exports(uploaded_files):
@@ -114,6 +129,100 @@ def save_uploaded_exports(uploaded_files):
             handle.write(file.getbuffer())
         saved_paths.append(str(path))
     return saved_paths
+
+
+def dataset_upload_signature(uploaded_files):
+    signature = []
+    for file in uploaded_files or []:
+        try:
+            size = int(file.getbuffer().nbytes)
+        except Exception:
+            size = 0
+        signature.append((file.name, size))
+    return tuple(signature)
+
+
+def read_uploaded_dataset(file) -> pd.DataFrame:
+    suffix = Path(file.name).suffix.lower()
+    file_bytes = file.getvalue()
+    if suffix in {".xlsx", ".xls"}:
+        return pd.read_excel(io.BytesIO(file_bytes))
+    return pd.read_csv(io.BytesIO(file_bytes), encoding="latin1")
+
+
+def prepare_uploaded_dataset_frame(dataframe: pd.DataFrame, file_name: str) -> pd.DataFrame:
+    prepared = dataframe.copy()
+    rename_map = {}
+    if DATASET_SOURCE_COLUMN in prepared.columns:
+        rename_map[DATASET_SOURCE_COLUMN] = f"{DATASET_SOURCE_COLUMN}_original"
+    if DATASET_ROW_COLUMN in prepared.columns:
+        rename_map[DATASET_ROW_COLUMN] = f"{DATASET_ROW_COLUMN}_original"
+    if "row_id" in prepared.columns:
+        rename_map["row_id"] = "row_id_original"
+    if rename_map:
+        prepared = prepared.rename(columns=rename_map)
+
+    prepared.insert(0, DATASET_ROW_COLUMN, range(1, len(prepared) + 1))
+    prepared.insert(0, DATASET_SOURCE_COLUMN, Path(file_name).name)
+    return prepared
+
+
+def save_uploaded_datasets(uploaded_files) -> pd.DataFrame:
+    clear_folder(DATASET_INPUT_DIR)
+
+    frames = []
+    files_summary = []
+    for file in uploaded_files or []:
+        original_path = DATASET_INPUT_DIR / Path(file.name).name
+        with original_path.open("wb") as handle:
+            handle.write(file.getbuffer())
+
+        dataframe = read_uploaded_dataset(file)
+        frames.append(prepare_uploaded_dataset_frame(dataframe, file.name))
+        files_summary.append({
+            "name": file.name,
+            "rows": int(len(dataframe)),
+            "columns": int(len(dataframe.columns)),
+            "path": str(original_path),
+        })
+
+    if not frames:
+        return pd.DataFrame()
+
+    combined = pd.concat(frames, ignore_index=True, sort=False)
+    combined.insert(0, "row_id", range(len(combined)))
+    combined.to_csv(SUPERSTORE_CSV, index=False, encoding="latin1")
+
+    manifest = {
+        "mode": "multi_dataset" if len(files_summary) > 1 else "single_dataset",
+        "source_column": DATASET_SOURCE_COLUMN,
+        "row_column": DATASET_ROW_COLUMN,
+        "combined_file": str(SUPERSTORE_CSV),
+        "total_rows": int(len(combined)),
+        "total_columns": int(len(combined.columns)),
+        "files": files_summary,
+    }
+    DATASET_MANIFEST.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    st.session_state.dataset_upload_summary = manifest
+
+    try:
+        chatbot_load_data.clear()
+        chatbot_init_db.clear()
+    except Exception:
+        pass
+
+    return combined
+
+
+def load_current_dataset_preview() -> pd.DataFrame:
+    if isinstance(st.session_state.get("dataset_preview"), pd.DataFrame) and not st.session_state.dataset_preview.empty:
+        return st.session_state.dataset_preview
+    if SUPERSTORE_CSV.exists():
+        try:
+            return pd.read_csv(SUPERSTORE_CSV, encoding="latin1")
+        except Exception:
+            return pd.DataFrame()
+    return pd.DataFrame()
 
 
 def build_pbix_prompt_suggestions(pbix_summary, charts):
@@ -143,7 +252,7 @@ def build_pbix_prompt_suggestions(pbix_summary, charts):
         )
     if len(report_names) >= 3:
         prompts.append(
-            f"Create a single chart comparing BLINKIT vs ZEPTO vs SWIGGY on the most comparable metric available, then list 3 insights."
+            "Create a single chart comparing the uploaded dashboards on the most comparable metric available, then list 3 insights."
         )
 
     return prompts[:5]
@@ -566,6 +675,15 @@ div[data-testid="stFileUploader"] section {
     background: rgba(255, 255, 255, 0.72);
 }
 
+div[data-testid="stTextArea"] textarea {
+    white-space: pre-wrap !important;
+    overflow-wrap: anywhere !important;
+    word-break: break-word !important;
+    resize: vertical;
+    min-height: 118px;
+    line-height: 1.5;
+}
+
 [data-testid="stMetric"] {
     background: rgba(255, 255, 255, 0.72);
     border: 1px solid #d7e3dc;
@@ -584,7 +702,7 @@ def render_hero():
 <section class="hero-panel">
     <h1>AI Data Analyst</h1>
     <p>
-        Upload a dataset or Power BI file, run the analysis, and review the report in one place.
+        Upload a dataset, Power BI file, or Tableau workbook, run the analysis, and review the report in one place.
         The report stays visible after generation so editing and reviewing are easier.
     </p>
 </section>
@@ -605,6 +723,34 @@ def render_status_cards(items: Iterable[tuple[str, str]]):
 """
         )
     st.markdown(f'<div class="status-row">{"".join(cards)}</div>', unsafe_allow_html=True)
+
+
+def parse_pbix_chat_reply(reply):
+    if not isinstance(reply, str):
+        return reply
+
+    clean = reply.strip()
+    if not clean:
+        return reply
+
+    if clean.startswith("```json"):
+        clean = clean[7:].strip()
+        if clean.endswith("```"):
+            clean = clean[:-3].strip()
+    elif clean.startswith("```") and clean.endswith("```"):
+        clean = clean[3:-3].strip()
+
+    start = clean.find("{")
+    end = clean.rfind("}")
+    if start != -1 and end > start:
+        clean = clean[start:end + 1]
+
+    try:
+        parsed = json.loads(clean)
+    except Exception:
+        return reply
+
+    return parsed if isinstance(parsed, dict) else reply
 
 
 def render_section_heading(title: str, description: str):
@@ -640,28 +786,6 @@ def render_report_assistant():
         display_chatbot()
     except Exception as error:
         st.error(f"Chatbot error: {error}")
-
-
-def save_uploaded_dataset(uploaded_file) -> pd.DataFrame:
-    suffix = Path(uploaded_file.name).suffix.lower()
-    file_bytes = uploaded_file.getvalue()
-    if suffix == ".xlsx":
-        dataframe = pd.read_excel(io.BytesIO(file_bytes))
-        dataframe.to_csv(SUPERSTORE_CSV, index=False, encoding="latin1")
-    else:
-        dataframe = pd.read_csv(io.BytesIO(file_bytes), encoding="latin1")
-        SUPERSTORE_CSV.write_bytes(file_bytes)
-
-    try:
-        chatbot_load_data.clear()
-        chatbot_init_db.clear()
-    except Exception:
-        pass
-
-    dataframe = dataframe.copy()
-    dataframe.reset_index(inplace=True)
-    dataframe.rename(columns={"index": "row_id"}, inplace=True)
-    return dataframe
 
 
 def activate_report_view(report_state_key: str):
@@ -758,21 +882,21 @@ with st.sidebar:
         """
 <div class="upload-card">
     <h3>Data Input</h3>
-    <p class="sidebar-note">Choose the file you want to analyze. CSV and Excel run dataset analysis. uploading 1 or more .pbix files generates a combined report.</p>
+    <p class="sidebar-note">Choose the file you want to analyze. CSV and Excel run dataset analysis. PBIX, TWB, and TWBX files generate a combined BI dashboard report.</p>
 </div>
 """,
         unsafe_allow_html=True,
     )
 
     uploaded = st.file_uploader(
-        "Upload CSV, Excel, or PBIX files",
-        type=["csv", "xlsx", "pbix"],
+        "Upload CSV, Excel, Power BI, or Tableau files",
+        type=["csv", "xlsx", "pbix", "twb", "twbx"],
         accept_multiple_files=True,
     )
 
     if uploaded:
-        pbix_files, export_files, dataset_files = split_uploaded_files(uploaded)
-        if pbix_files:
+        pbix_files, tableau_files, export_files, dataset_files = split_uploaded_files(uploaded)
+        if pbix_files or tableau_files:
             st.session_state.mode = "pbix"
         elif dataset_files:
             st.session_state.mode = "dataset"
@@ -800,26 +924,51 @@ with st.sidebar:
 if st.session_state.mode == "dataset":
     render_section_heading(
         "Dataset Analysis Workspace",
-        "Upload a dataset, generate the report, and keep the report visible while you review and edit it.",
+        "Upload one or more datasets, generate the report, and keep the report visible while you review and edit it.",
     )
 
     dataset_preview = pd.DataFrame()
     if uploaded:
-        dataset_preview = save_uploaded_dataset(uploaded[0])
-        st.success("Dataset uploaded successfully.")
+        _, _, _, dataset_files = split_uploaded_files(uploaded)
+        signature = dataset_upload_signature(dataset_files)
+        if st.session_state.dataset_upload_signature != signature:
+            dataset_preview = save_uploaded_datasets(dataset_files)
+            st.session_state.dataset_preview = dataset_preview
+            st.session_state.dataset_upload_signature = signature
+        else:
+            dataset_preview = load_current_dataset_preview()
+
+        source_count = len(st.session_state.dataset_upload_summary.get("files", dataset_files))
+        if source_count > 1:
+            st.success(
+                f"{source_count} dataset files uploaded. Each file will get its own chart set, "
+                "with a combined bridge for cross-file questions."
+            )
+        else:
+            st.success("Dataset uploaded successfully.")
 
     data, _conn = initialize_chatbot()
     poll_dataset_analysis()
     recover_dataset_report_if_ready()
 
     active_dataset = dataset_preview if not dataset_preview.empty else data
-    current_file_name = uploaded[0].name if uploaded else SUPERSTORE_CSV.name
+    dataset_summary = st.session_state.get("dataset_upload_summary", {})
+    uploaded_file_names = [
+        item.get("name", "")
+        for item in dataset_summary.get("files", [])
+        if item.get("name")
+    ]
+    source_file_count = len(uploaded_file_names) or (1 if uploaded else 0)
+    current_file_name = ", ".join(uploaded_file_names[:3]) if uploaded_file_names else SUPERSTORE_CSV.name
+    if len(uploaded_file_names) > 3:
+        current_file_name += f" + {len(uploaded_file_names) - 3} more"
     if isinstance(active_dataset, pd.DataFrame) and not active_dataset.empty:
         render_status_cards([
             ("Mode", "Dataset"),
             ("Rows", f"{len(active_dataset):,}"),
             ("Columns", str(len(active_dataset.columns))),
-            ("Current file", current_file_name),
+            ("Source files", str(source_file_count or 1)),
+            ("Current input", current_file_name),
         ])
         with st.expander("Preview dataset", expanded=False):
             st.dataframe(active_dataset.head(12), width="stretch")
@@ -883,37 +1032,41 @@ if st.session_state.mode == "dataset":
 
 elif st.session_state.mode == "pbix":
     render_section_heading(
-        "Power BI Report Workspace",
-        "Process PBIX files, extract chart information, and review the generated report in the newer floating report workspace. "
-        "When the saved PBIX cannot expose its local tables directly, the app will try to recover them from the PBIX source definition first.",
+        "BI Dashboard Report Workspace",
+        "Process Power BI and Tableau dashboards, extract chart information, and review the generated report in the newer floating report workspace. "
+        "When a dashboard cannot expose its tables directly, the app will use packaged workbook data or recover local source definitions when available.",
     )
 
     if uploaded:
-        pbix_files, export_files, _ = split_uploaded_files(uploaded)
+        pbix_files, tableau_files, export_files, _ = split_uploaded_files(uploaded)
         pbix_summary = st.session_state.get("pbix_extraction_summary", {})
-        render_status_cards([
-            ("Mode", "Power BI"),
-            ("PBIX files", str(len(pbix_files))),
-            ("Fallback tables", str(len(export_files))),
-            ("Charts with data", str(pbix_summary.get("chart_data_count", 0))),
-            ("Visual definitions", str(pbix_summary.get("metadata_visual_count", 0))),
-            ("Report ready", "Yes" if st.session_state.report_ready else "Not yet"),
-        ])
+        status_cards_placeholder = st.empty()
+        with status_cards_placeholder:
+            render_status_cards([
+                ("Mode", "BI Dashboards"),
+                ("PBIX files", str(len(pbix_files))),
+                ("Tableau files", str(len(tableau_files))),
+                ("Fallback tables", str(len(export_files))),
+                ("Charts with data", str(pbix_summary.get("chart_data_count", 0))),
+                ("Visual definitions", str(pbix_summary.get("metadata_visual_count", 0))),
+                ("Report ready", "Yes" if st.session_state.report_ready else "Not yet"),
+            ])
 
         if export_files:
             export_names = ", ".join(file.name for file in export_files)
             st.info(
                 f"Fallback export files detected: {export_names}. "
-                "These will be used if the PBIX layout references tables that are not embedded locally."
+                "These will be used if a dashboard references tables that are not embedded or packaged locally."
             )
 
-        if st.button("Process PBIX", type="primary"):
-            with st.spinner("Processing PBIX..."):
+        if st.button("Process BI dashboards", type="primary"):
+            with st.spinner("Processing BI dashboards..."):
                 clear_folder(REPORT_INPUT_DIR)
-                for file in pbix_files:
+                for file in pbix_files + tableau_files:
                     path = REPORT_INPUT_DIR / file.name
                     with path.open("wb") as handle:
                         handle.write(file.getbuffer())
+
 
                 external_data_paths = save_uploaded_exports(export_files)
                 charts = rag_pipeline.process_all_reports(
@@ -923,8 +1076,19 @@ elif st.session_state.mode == "pbix":
                 summary = rag_pipeline.get_last_extraction_summary()
                 st.session_state.charts = charts
                 st.session_state.pbix_extraction_summary = summary
+                
+                with status_cards_placeholder:
+                    render_status_cards([
+                        ("Mode", "BI Dashboards"),
+                        ("PBIX files", str(len(pbix_files))),
+                        ("Tableau files", str(len(tableau_files))),
+                        ("Fallback tables", str(len(export_files))),
+                        ("Charts with data", str(summary.get("chart_data_count", 0))),
+                        ("Visual definitions", str(summary.get("metadata_visual_count", 0))),
+                        ("Report ready", "Generating..."),
+                    ])
                 st.success(
-                    f"{summary.get('chart_data_count', 0)} charts with embedded data, "
+                    f"{summary.get('chart_data_count', 0)} charts with embedded or packaged data, "
                     f"{summary.get('metadata_visual_count', 0)} visual definitions extracted."
                 )
                 if summary.get("fallback_alias_count", 0):
@@ -933,8 +1097,8 @@ elif st.session_state.mode == "pbix":
                     )
                 if summary.get("metadata_visual_count", 0):
                     st.info(
-                        "Some visuals were found in the PBIX layout, but their source tables were "
-                        "not embedded in the local file. Those items are shown as chart definitions "
+                        "Some visuals were found in dashboard metadata, but their source tables were "
+                        "not embedded or packaged in the local file. Those items are shown as chart definitions "
                         "with field mappings instead of numeric chart values."
                     )
 
@@ -952,12 +1116,13 @@ elif st.session_state.mode == "pbix":
             st.markdown(
                 f"""
 <div class="report-action-band">
-    <strong>PBIX extraction snapshot</strong>
+    <strong>BI extraction snapshot</strong>
     <span>
         Charts with data: {pbix_summary.get("chart_data_count", 0)} |
         layout-only visuals: {pbix_summary.get("metadata_visual_count", 0)} |
         visuals scanned: {pbix_summary.get("visuals_seen", 0)} |
-        fallback aliases used: {pbix_summary.get("fallback_alias_count", 0)}
+        Power BI: {pbix_summary.get("pbix_report_count", 0)} |
+        Tableau: {pbix_summary.get("tableau_report_count", 0)}
     </span>
 </div>
 """,
@@ -976,10 +1141,10 @@ elif st.session_state.mode == "pbix":
         st.markdown(
             f"""
 <div class="dataset-workspace-hero">
-    <div class="dataset-workspace-kicker">Power BI Chart Workspace</div>
+    <div class="dataset-workspace-kicker">BI Chart Workspace</div>
     <div class="dataset-workspace-title">Review extracted visuals, ask analytical questions, and generate follow-up chart views</div>
     <div class="dataset-workspace-copy">
-        This workspace uses the PBIX visual structure plus recovered chart data when available, so you can ask for comparisons,
+        This workspace uses Power BI and Tableau visual structure plus recovered chart data when available, so you can ask for comparisons,
         performance drivers, risks, and recommendation-ready summaries without losing the report context.
     </div>
     <div class="dataset-workspace-meta-grid">
@@ -1023,7 +1188,7 @@ elif st.session_state.mode == "pbix":
                 """
 <div class="report-feedback-card">
     <h4>Visual preview deck</h4>
-    <p>Preview the extracted Power BI visuals before asking a question. This helps you keep the active chart, page, and measure context in view while you analyze the report.</p>
+    <p>Preview the extracted BI visuals before asking a question. This helps you keep the active chart, page, and measure context in view while you analyze the report.</p>
 </div>
 """,
                 unsafe_allow_html=True,
@@ -1035,10 +1200,16 @@ elif st.session_state.mode == "pbix":
                     chart_titles,
                     key="chat_preview_chart",
                 )
-                for chart in charts:
-                    if chart.get("title", "Untitled") == selected_title:
-                        render_chart(chart)
-                        break
+                if st.toggle(
+                    "Show selected visual preview",
+                    value=False,
+                    key="pbix_show_selected_visual_preview",
+                    help="Keep this off for smoother chat. Turn it on only when you need to inspect a visual.",
+                ):
+                    for chart in charts:
+                        if chart.get("title", "Untitled") == selected_title:
+                            render_chart(chart)
+                            break
             else:
                 st.info("No extracted charts are available yet.")
 
@@ -1052,7 +1223,7 @@ elif st.session_state.mode == "pbix":
                 f"""
 <div class="report-feedback-card">
     <h4>Good questions to ask</h4>
-    <p>These prompts are tuned for the current Power BI chat logic, especially when you upload multiple dashboards together.</p>
+    <p>These prompts are tuned for the current BI chart logic, especially when you upload multiple dashboards together.</p>
     <ul>{prompt_lines}</ul>
 </div>
 """,
@@ -1074,17 +1245,33 @@ elif st.session_state.mode == "pbix":
 
         col1, col2 = st.columns([8, 2])
         with col1:
-            user_input = st.text_input("Ask about your Power BI charts...", key="pbix_user_input")
+            user_input = st.text_area(
+                "Ask about your BI dashboard charts...",
+                key="pbix_user_input",
+                height=130,
+                placeholder=(
+                    "Ask for insights, comparisons, risks, or a chart. "
+                    "Long questions will wrap down here so you can review the full prompt."
+                ),
+            )
         with col2:
             send = st.button("Send", key="pbix_send_btn")
 
-        if send and user_input:
-            st.session_state.pbix_conversation.append({"role": "user", "content": user_input})
+        if send and user_input.strip():
+            st.session_state.pbix_conversation.append({"role": "user", "content": user_input.strip()})
             with st.spinner("Analyzing charts..."):
-                reply = rag_pipeline.ask_gemini_charts(user_input, st.session_state.charts)
+                reply = rag_pipeline.ask_gemini_charts(user_input.strip(), st.session_state.charts)
+                reply = parse_pbix_chat_reply(reply)
                 st.session_state.pbix_conversation.append({"role": "assistant", "content": reply})
 
-        for message in reversed(st.session_state.pbix_conversation):
+        visible_messages = st.session_state.pbix_conversation[-8:]
+        if len(st.session_state.pbix_conversation) > len(visible_messages):
+            st.caption(
+                f"Showing the latest {len(visible_messages)} chart-chat messages "
+                f"out of {len(st.session_state.pbix_conversation)} for performance."
+            )
+
+        for message in reversed(visible_messages):
             if message["role"] == "user":
                 st.markdown(f"**You:** {message['content']}")
             else:
@@ -1100,14 +1287,14 @@ else:
     render_status_cards([
         ("Mode", "Waiting for file"),
         ("Dataset reports", "Supported"),
-        ("PBIX reports", "Supported"),
+        ("BI dashboards", "PBIX, TWB, TWBX"),
         ("Next step", "Upload a file"),
     ])
     st.markdown(
         """
 <div class="panel-card">
     <h3>Start here</h3>
-    <p>Upload a CSV, Excel, or PBIX file from the left sidebar to begin analysis.</p>
+    <p>Upload a CSV, Excel, PBIX, TWB, or TWBX file from the left sidebar to begin analysis.</p>
     <p>The report will stay visible after it is generated so you can review and edit it more easily.</p>
 </div>
 """,

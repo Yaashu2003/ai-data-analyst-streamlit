@@ -56,7 +56,7 @@ class IntelligentAnalysisPlanner:
             print("⚡ Using Gemini planner...")
 
             response = self.client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-3.1-flash-lite",
                 contents=[self._build_prompt(profile)]
             )
 
@@ -83,6 +83,9 @@ You are an expert data analyst.
 
 Dataset profile:
 {json.dumps(profile, indent=2)}
+
+If a column named "source_file" exists, it identifies which uploaded CSV/XLSX file each row came from.
+For multi-file datasets, include cross-file comparisons using "source_file" when useful.
 
 Return JSON ONLY:
 
@@ -140,6 +143,17 @@ Return JSON ONLY:
             plan["specialized_analyses"].append({
                 "function": "anomaly_detection",
                 "columns": numeric[:1]
+            })
+
+        if "source_file" in categorical and numeric:
+            plan["specialized_analyses"].append({
+                "function": "distribution_comparison",
+                "columns": [numeric[0], "source_file"]
+            })
+            plan["visualizations"].append({
+                "chart_type": "bar_chart",
+                "columns": ["source_file", numeric[0]],
+                "title": f"Cross-File Comparison by Total {numeric[0].title()}"
             })
 
         if len(numeric) >= 3 and categorical:
@@ -313,6 +327,14 @@ Return JSON ONLY:
         if date_cols:
             profile['date_columns'] = {
                 'columns': date_cols
+            }
+
+        if "source_file" in df.columns:
+            source_counts = df["source_file"].astype(str).value_counts().head(12)
+            profile["multi_file_context"] = {
+                "source_column": "source_file",
+                "source_files": source_counts.index.tolist(),
+                "rows_by_source_file": {str(key): int(value) for key, value in source_counts.items()},
             }
 
         return profile

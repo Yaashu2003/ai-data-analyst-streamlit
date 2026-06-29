@@ -16,6 +16,29 @@ Use:
 streamlit run main_app.py
 ```
 
+## FastAPI + React app
+
+Use this version for heavier dashboard workflows where Streamlit may freeze during long PBIX/Tableau processing:
+
+```bash
+uvicorn backend_main:app --reload --host 0.0.0.0 --port 8000
+```
+
+Then open:
+
+```text
+http://localhost:8000
+```
+
+This app supports background jobs for:
+
+- CSV / Excel dataset analysis
+- Power BI `.pbix` dashboard extraction
+- Tableau `.twb` / `.twbx` dashboard extraction
+- mixed Power BI + Tableau comparison
+- chart chatbot
+- report feedback regeneration
+
 ## Local setup
 
 1. Create a virtual environment.

@@ -191,7 +191,7 @@ def render_pbix_analysis_sections(reply_data):
 
     fallback_parts = []
     for key, value in reply_data.items():
-        if key in {"response_type", "title", "chart_type", "x", "y", "series"}:
+        if key in {"response_type", "title", "chart_type", "x", "y", "series", "chart"}:
             continue
         label = str(key).replace("_", " ").title()
         if isinstance(value, list):
@@ -213,11 +213,19 @@ def render_pbix_chat_response(reply_data):
         return
 
     response_type = reply_data.get("response_type", "")
-    if response_type == "new_chart" and "title" in reply_data:
+    chart_payload = None
+    if response_type == "new_chart" and (
+        "series" in reply_data or "y" in reply_data or reply_data.get("card_value") is not None
+    ):
+        chart_payload = reply_data
+    elif isinstance(reply_data.get("chart"), dict):
+        chart_payload = reply_data["chart"]
+
+    if chart_payload:
         st.markdown(
-            f"**AI:** Here is the newly generated chart: *{reply_data.get('title', 'Generated Chart')}*"
+            f"**AI:** Here is the newly generated chart: *{chart_payload.get('title', 'Generated Chart')}*"
         )
-        render_chart(reply_data)
+        render_chart(chart_payload)
 
     render_pbix_analysis_sections(reply_data)
 
@@ -228,92 +236,58 @@ def render_pbix_chat_response(reply_data):
 
 if __name__ == "__main__":
     # =====================================================
-    # CHAT QUERY
+    # CHAT QUERY — vertical inline panel
     # =====================================================
-    
-    with st.popover("💬 Ask about Report"):
-        st.write("Ask questions about the charts and report.")
-        
-        # Add Chart Previews directly in the chatbot popover
-        charts = st.session_state.get("charts", [])
-        if charts:
-            with st.expander("📊 Extracted Charts Preview", expanded=False):
-                chart_titles = [c.get("title", "Untitled") for c in charts]
-                selected_title = st.selectbox("Select a chart to preview:", chart_titles, key="chat_preview_chart")
-                for c in charts:
-                    if c.get("title", "Untitled") == selected_title:
-                        render_chart(c)
-                        break
-                        
+
+    st.markdown("---")
+    st.subheader("💬 Ask about your Dashboards")
+
+    charts = st.session_state.get("charts", [])
+
+    if not charts:
+        st.info("Upload and process your reports above to enable the chatbot.")
+    else:
+        with st.expander("📊 Extracted Charts Preview", expanded=False):
+            chart_titles = [c.get("title", "Untitled") for c in charts]
+            selected_title = st.selectbox("Select a chart to preview:", chart_titles, key="chat_preview_chart")
+            for c in charts:
+                if c.get("title", "Untitled") == selected_title:
+                    render_chart(c)
+                    break
+
+        if "chat_history" not in st.session_state:
+            st.session_state["chat_history"] = []
+
+        for msg in st.session_state["chat_history"]:
+            with st.chat_message(msg["role"]):
+                if msg["role"] == "assistant" and isinstance(msg.get("data"), dict):
+                    render_pbix_chat_response(msg["data"])
+                else:
+                    st.markdown(msg["content"])
+
         query = st.chat_input("Ask about your dashboard...")
-        
+
         if query:
-            # Display user query in chat format
+            st.session_state["chat_history"].append({"role": "user", "content": query})
             with st.chat_message("user"):
                 st.markdown(query)
-                
-            charts = st.session_state.get("charts", [])
-        
-            if not charts:
-                with st.chat_message("assistant"):
-                    st.warning("Upload reports first")
-            else:
-                with st.spinner("Analyzing dashboards..."):
-                    result = rag_pipeline.ask_gemini_charts(query, charts)
-        
-                # Handle string JSON
-                if isinstance(result, str):
-                    try:
-                        result = json.loads(result)
-                    except:
-                        with st.chat_message("assistant"):
-                            st.write(result)
-                        st.stop()
-        
-                if isinstance(result, dict):
-                    with st.chat_message("assistant"):
-                        render_pbix_chat_response(result)
 
-                if isinstance(result, dict) and False:
-                    rtype = result.get("response_type", "")
-        
-                    with st.chat_message("assistant"):
-                        # ------------------------------------
-                        # CHART RESPONSE
-                        # ------------------------------------
-                        if rtype == "new_chart":
-                            render_chart(result)
-                            insights = result.get("insights", [])
-                            if insights:
-                                st.subheader("📌 Insights")
-                                for ins in insights:
-                                    st.markdown(f"• {ins}")
-                        elif rtype == "explanation":
-                            st.subheader("📌 Insights")
-                            
-                            text_parts = []
-                            if "text" in result and result["text"]: text_parts.append(str(result["text"]))
-                            if "explanation" in result and result["explanation"]: text_parts.append(str(result["explanation"]))
-                            if "answer" in result and result["answer"]: text_parts.append(str(result["answer"]))
-                            if "insights" in result and result["insights"]:
-                                if isinstance(result["insights"], list):
-                                    text_parts.append("\n".join(f"- {i}" for i in result["insights"]))
-                                else:
-                                    text_parts.append(str(result["insights"]))
-                                    
-                            if not text_parts:
-                                for k, v in result.items():
-                                    if k not in ["response_type", "title", "chart_type", "x", "y", "series"]:
-                                        if isinstance(v, list):
-                                            text_parts.append(f"**{str(k).replace('_', ' ').title()}**:\n" + "\n".join(f"- {i}" for i in v))
-                                        else:
-                                            text_parts.append(f"**{str(k).replace('_', ' ').title()}**: {v}")
-        
-                            out_text = "\n\n".join(text_parts).strip()
-                            if out_text:
-                                st.markdown(out_text)
-                            else:
-                                st.markdown(f"(Received empty or unparseable response: `{result}`)")
+            with st.spinner("Analyzing dashboards..."):
+                result = rag_pipeline.ask_gemini_charts(query, charts)
+
+            if isinstance(result, str):
+                try:
+                    result = json.loads(result)
+                except Exception:
+                    pass
+
+            with st.chat_message("assistant"):
+                if isinstance(result, dict):
+                    render_pbix_chat_response(result)
+                    st.session_state["chat_history"].append({"role": "assistant", "content": "", "data": result})
+                else:
+                    st.markdown(str(result))
+                    st.session_state["chat_history"].append({"role": "assistant", "content": str(result)})
     
     
     # =====================================================

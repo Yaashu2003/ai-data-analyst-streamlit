@@ -25,6 +25,9 @@ _IGNORED_STEMS = {
 }
 
 _PRIORITY_TOKENS = [
+    "cross_file_metric",
+    "cross_file_category_mix",
+    "cross_file_records",
     "dashboard",
     "correlation_network",
     "anomaly",

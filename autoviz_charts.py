@@ -230,12 +230,15 @@ class AutovizChartGenerator:
             domain={"x": [0.74, 1.0], "y": [0.79, 0.98]},
         ))
 
-    def generate_autoviz_charts(self, df, dataset_name="Dataset", existing_chart_stems=None):
+    def generate_autoviz_charts(self, df, dataset_name="Dataset", existing_chart_stems=None, filename_prefix=""):
         print("Generating Smart Business Dashboard...")
 
         saved_paths: List[str] = []
         generated_stems: Set[str] = set()
         existing_chart_stems = self._normalize_existing_stems(existing_chart_stems)
+
+        def chart_name(name: str) -> str:
+            return f"{filename_prefix}{name}" if filename_prefix else name
 
         try:
             cat_cols, num_cols = self._select_columns(df)
@@ -343,7 +346,7 @@ class AutovizChartGenerator:
                 dashboard_fig.update_xaxes(automargin=True, tickfont=dict(size=11), row=2, col=2)
                 dashboard_fig.update_yaxes(automargin=True, tickfont=dict(size=11), row=2, col=2)
 
-                self._save_chart(dashboard_fig, "Dashboard", saved_paths)
+                self._save_chart(dashboard_fig, chart_name("Dashboard"), saved_paths)
                 generated_stems.add("dashboard")
 
             if best_cats and self._can_emit_chart("Category_Subplots", existing_chart_stems, generated_stems):
@@ -382,7 +385,7 @@ class AutovizChartGenerator:
                 )
                 fig_multi.update_xaxes(automargin=True)
                 fig_multi.update_yaxes(automargin=True)
-                self._save_chart(fig_multi, "Category_Subplots", saved_paths)
+                self._save_chart(fig_multi, chart_name("Category_Subplots"), saved_paths)
                 generated_stems.add("category_subplots")
 
             if best_cats and num and self._can_emit_chart("Top_10_Category_Bar", existing_chart_stems, generated_stems):
@@ -403,7 +406,7 @@ class AutovizChartGenerator:
                         coloraxis_showscale=False,
                         margin=dict(l=110, r=40, t=90, b=50),
                     )
-                    self._save_chart(fig, "Top_10_Category_Bar", saved_paths)
+                    self._save_chart(fig, chart_name("Top_10_Category_Bar"), saved_paths)
                     generated_stems.add("top_10_category_bar")
 
             if best_cats and num and self._can_emit_chart("Market_Composition_Treemap", existing_chart_stems, generated_stems):
@@ -436,7 +439,7 @@ class AutovizChartGenerator:
                         height=760,
                         coloraxis_showscale=False,
                     )
-                    self._save_chart(fig, "Market_Composition_Treemap", saved_paths)
+                    self._save_chart(fig, chart_name("Market_Composition_Treemap"), saved_paths)
                     generated_stems.add("market_composition_treemap")
 
             if len(num_cols) >= 2 and self._can_emit_chart("Numeric_Relationship_Scatter", existing_chart_stems, generated_stems):
@@ -458,7 +461,7 @@ class AutovizChartGenerator:
                     )
                     fig.update_xaxes(automargin=True, tickangle=-18)
                     fig.update_yaxes(automargin=True)
-                    self._save_chart(fig, "Numeric_Relationship_Scatter", saved_paths)
+                    self._save_chart(fig, chart_name("Numeric_Relationship_Scatter"), saved_paths)
                     generated_stems.add("numeric_relationship_scatter")
 
             print(f"\nCharts Generated: {len(saved_paths)}")

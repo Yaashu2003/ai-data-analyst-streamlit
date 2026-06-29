@@ -2,6 +2,7 @@ import re
 import difflib
 from pathlib import Path
 import json
+from html import escape
 from pbix_chart_viz import build_pbix_figure
 
 BASE_DIR = Path(__file__).parent
@@ -353,10 +354,64 @@ def build_chart_html(chart):
     fig = build_pbix_figure(chart)
     if fig is None:
         return ""
-    # Using 'cdn' is important to avoid shipping huge base64 strings if not needed, 
-    # but for completely self-contained reports, sometimes it needs to be 'True'.
-    # I kept it 'cdn' to match the previous implementation.
-    return fig.to_html(full_html=False, include_plotlyjs='cdn')
+    fig.update_layout(autosize=True, width=None)
+    # Chart fragments are placed inside lazy iframes that load Plotly on demand.
+    # Do not include Plotly in the fragment itself.
+    return fig.to_html(
+        full_html=False,
+        include_plotlyjs=False,
+        config={"responsive": True, "displayModeBar": False},
+        default_width="100%",
+        default_height="500px",
+    )
+
+
+def build_chart_iframe(chart):
+    chart_html = build_chart_html(chart)
+    if not chart_html:
+        return "<div class='chart-placeholder'>Chart could not be rendered.</div>"
+    if not chart.get("data_available", True):
+        return chart_html
+
+    chart_document = f"""
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+        <style>
+            html, body {{ margin: 0; padding: 0; background: #fff; overflow: hidden; width: 100%; }}
+            body {{ font-family: Arial, sans-serif; }}
+            .plotly-graph-div,
+            .js-plotly-plot,
+            .svg-container {{
+                width: 100% !important;
+                max-width: 100% !important;
+            }}
+        </style>
+    </head>
+    <body>
+        {chart_html}
+        <script>
+            function resizeCharts() {{
+                if (!window.Plotly) return;
+                document.querySelectorAll('.js-plotly-plot, .plotly-graph-div').forEach(function (chart) {{
+                    chart.style.width = '100%';
+                    window.Plotly.Plots.resize(chart);
+                }});
+            }}
+            window.addEventListener('load', resizeCharts);
+            window.addEventListener('resize', resizeCharts);
+            setTimeout(resizeCharts, 150);
+        </script>
+    </body>
+    </html>
+    """.strip()
+    return (
+        "<iframe class='chart-frame' loading='lazy' "
+        f"srcdoc=\"{escape(chart_document, quote=True)}\"></iframe>"
+    )
 
 # -------------------------
 # TEXT FORMATTING (From CSV app logic)
@@ -393,15 +448,15 @@ def _format_content_to_html(content_text: str, is_recommendation: bool) -> str:
 # -------------------------
 # GENERATE HTML REPORT
 # -------------------------
-def generate_html(charts_data=None):
+def generate_html(charts_data=None, report_text=None, output_path=None):
     if charts_data is None:
         charts_data = []
     reportable_charts = [chart for chart in charts_data if is_reportable_chart(chart)]
 
-    content = read_report()
+    content = report_text if report_text is not None else read_report()
     if not content:
         print("[ERROR] No report found")
-        return
+        return ""
     
     main_text = extract_main_report(content)
     
@@ -466,7 +521,14 @@ def generate_html(charts_data=None):
     chart_display_content = "<div class='charts-header'><h4>Chart Catalog (Sequentially Explained)</h4></div>"
     chart_display_content += "<div class='sequential-chart-list'>"
     
-    target_chart_count = min(max(len(parsed_charts), 6), max(len(reportable_charts), 1), 8)
+    if reportable_charts:
+        minimum_chart_count = min(8, len(reportable_charts))
+        target_chart_count = min(
+            max(len(parsed_charts), minimum_chart_count),
+            len(reportable_charts),
+        )
+    else:
+        target_chart_count = 0
     selected_charts = select_diverse_reportable_charts(reportable_charts, limit=target_chart_count)
 
     matched_chart_entries = []
@@ -492,7 +554,7 @@ def generate_html(charts_data=None):
         chart_display_content += "<div class='chart-pair'>"
         
         c1_info, c1_data = matched_chart_entries[i]
-        c1_html = build_chart_html(c1_data)
+        c1_html = build_chart_iframe(c1_data)
         
         chart_display_content += f"""
         <div class="chart-item">
@@ -509,7 +571,7 @@ def generate_html(charts_data=None):
         # Chart 2
         if i + 1 < len(matched_chart_entries):
             c2_info, c2_data = matched_chart_entries[i+1]
-            c2_html = build_chart_html(c2_data)
+            c2_html = build_chart_iframe(c2_data)
             chart_display_content += f"""
             <div class="chart-item">
                 <h5>{c2_info["title"]}</h5>
@@ -530,7 +592,7 @@ def generate_html(charts_data=None):
         chart_display_content = (
             "<div class='charts-header'><h4>Chart Catalog (Sequentially Explained)</h4></div>"
             "<div class='sequential-chart-list'><div class='chart-item'>"
-            "<div class='chart-explanation'><p>No usable numeric Power BI charts were available for this report run.</p></div>"
+            "<div class='chart-explanation'><p>No usable numeric BI dashboard charts were available for this report run.</p></div>"
             "</div></div>"
         )
 
@@ -545,7 +607,7 @@ def generate_html(charts_data=None):
                 for idx, gc in enumerate(gen_charts):
                     if idx > 0 and idx % 2 == 0:
                         chart_display_content += "</div><div class='chart-pair'>"
-                    html_gc = build_chart_html(gc)
+                    html_gc = build_chart_iframe(gc)
                     title_gc = gc.get("title", "New Variable Chart")
                     chart_display_content += f"""
                     <div class="chart-item">
@@ -580,7 +642,13 @@ def generate_html(charts_data=None):
         .charts-header { margin-top: 30px; margin-bottom: 15px; border-bottom: 2px solid #3f51b5; padding-bottom: 5px; }
         .charts-header h4 { color: #3f51b5 !important; font-size: 1.2em; margin-bottom: 0; }
         .sequential-chart-list { display: flex; flex-direction: column; gap: 40px; margin-top: 20px; padding: 15px; background-color: #fcfcfc; border: 1px solid #eee; border-radius: 8px; box-sizing: border-box; width: 100%;}
-        .chart-pair { display: flex; gap: 20px; width: 100%; box-sizing: border-box;}
+        .chart-pair {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(min(100%, 620px), 1fr));
+            gap: 20px;
+            width: 100%;
+            box-sizing: border-box;
+        }
         .chart-item { flex: 1; border: 1px solid #e0e0e0; padding: 20px; border-radius: 8px; background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,0.05); display: flex; flex-direction: column; box-sizing: border-box; overflow: hidden; }
         .chart-item h5 { margin: 0 0 15px 0; color: #2e7d32; border-bottom: 1px dashed #eee; padding-bottom: 5px; font-size: 1.1em; }
         .chart-explanation { width: 100%; }
@@ -589,26 +657,31 @@ def generate_html(charts_data=None):
             width: 100%;
             text-align: center;
             margin-bottom: 15px;
-            overflow-x: auto;
-            overflow-y: hidden;
+            overflow: hidden;
             display: block;
-            padding-bottom: 8px;
-            -webkit-overflow-scrolling: touch;
-            touch-action: pan-x;
-        }
-        .chart-visual-wrapper::-webkit-scrollbar { height: 10px; }
-        .chart-visual-wrapper::-webkit-scrollbar-thumb {
-            background: rgba(37, 99, 235, 0.28);
-            border-radius: 999px;
+            padding-bottom: 0;
         }
         .chart-visual-wrapper .plotly-graph-div,
         .chart-visual-wrapper .js-plotly-plot {
-            min-width: 980px;
+            width: 100% !important;
+            max-width: 100% !important;
+            min-width: 0 !important;
             margin: 0 auto;
         }
         .chart-visual-wrapper .plotly-graph-div .svg-container,
         .chart-visual-wrapper .js-plotly-plot .svg-container {
-            min-width: 980px !important;
+            width: 100% !important;
+            max-width: 100% !important;
+            min-width: 0 !important;
+        }
+        .chart-frame {
+            width: 100%;
+            min-height: 540px;
+            height: 56vh;
+            max-height: 680px;
+            border: 0;
+            display: block;
+            background: #fff;
         }
         .chart-placeholder { color: #cc0000; border: 1px dashed #cc0000; padding: 10px; text-align: center; }
         .chart-metadata-card { width: 100%; text-align: left; border: 1px solid #d7e3dc; border-radius: 12px; background: #f8fbff; padding: 16px; color: #213547; box-sizing: border-box; }
@@ -625,10 +698,10 @@ def generate_html(charts_data=None):
     <!DOCTYPE html>
     <html lang="en">
     <head>
+        <!-- AI_DATA_ANALYST_REPORT_HTML_VERSION=lazy_chart_iframe_v2 -->
         <meta charset="UTF-8">
         <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <title>Intelligent Data Analysis Report</title>
-        <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
         <style>
             body {{ font-family: Arial, sans-serif; margin: 0; padding: 0; background-color: #f4f7f6; }}
             .container {{ width: 95%; max-width: 1200px; margin: 20px auto; background: #fff; box-shadow: 0 4px 12px rgba(0,0,0,0.1); border-radius: 8px; }}
@@ -641,7 +714,7 @@ def generate_html(charts_data=None):
         <div class="container">
             <h1>Intelligent Data Analysis Report</h1>
             <div class="tab">
-                <button class="active">⭐ Power BI Executive Report & Visual Analysis</button>
+                <button class="active">⭐ BI Executive Report & Visual Analysis</button>
             </div>
             <div class="report-section">
                 <h3>⭐ Executive Summary</h3>
@@ -650,14 +723,37 @@ def generate_html(charts_data=None):
                 {chart_display_content}
             </div>
         </div>
+        <script>
+            (function () {{
+                function getSelectedText() {{
+                    var selection = window.getSelection ? window.getSelection() : null;
+                    return selection ? String(selection.toString()).trim() : "";
+                }}
+                function sendSelection(kind, event) {{
+                    var text = getSelectedText();
+                    if (!text) return;
+                    if (kind === "report-selection-context" && event) event.preventDefault();
+                    window.parent.postMessage({{ type: kind, text: text }}, window.location.origin);
+                }}
+                document.addEventListener("mouseup", function (event) {{
+                    sendSelection("report-selection", event);
+                }});
+                document.addEventListener("contextmenu", function (event) {{
+                    sendSelection("report-selection-context", event);
+                }});
+            }})();
+        </script>
     </body>
     </html>
     '''
 
-    with open(OUTPUT_HTML, "w", encoding="utf-8") as f:
+    target_path = Path(output_path) if output_path else OUTPUT_HTML
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(target_path, "w", encoding="utf-8") as f:
         f.write(html)
 
     print("[OK] HTML report generated")
+    return html
 
 if __name__ == "__main__":
     generate_html([])

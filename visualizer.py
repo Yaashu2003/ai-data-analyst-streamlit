@@ -22,6 +22,7 @@ _CHARTS_HTML_DIR = _VIS_BASE_DIR / "charts_html"
 class ComprehensiveVisualizationGenerator:
     """Complete visualization generator with all chart types"""
     _DEFAULT_SKEW_THRESHOLD = 1.0  # absolute skew above this will trigger log1p transform
+    _SOURCE_FILE_COLUMN = "source_file"
 
 
     # ------------------------- Helper utilities -------------------------
@@ -108,10 +109,196 @@ class ComprehensiveVisualizationGenerator:
             return f"{title} (log-transformed, offset={meta.get('offset', 0):.6g})"
         return title
 
+    @staticmethod
+    def _cross_file_numeric_columns(df: pd.DataFrame) -> List[str]:
+        numeric_columns: List[str] = []
+        excluded_tokens = ("id", "row", "postal", "zip", "pincode", "code")
+        for column in df.columns:
+            lowered = str(column).lower()
+            if column == ComprehensiveVisualizationGenerator._SOURCE_FILE_COLUMN or any(token in lowered for token in excluded_tokens):
+                continue
+            numeric = pd.to_numeric(df[column], errors="coerce")
+            if numeric.notna().sum() >= max(3, int(len(df) * 0.15)) and numeric.nunique(dropna=True) > 1:
+                numeric_columns.append(column)
+        return numeric_columns
+
+    @staticmethod
+    def _cross_file_category_column(df: pd.DataFrame) -> Optional[str]:
+        for column in df.select_dtypes(include=["object", "category"]).columns:
+            if column == ComprehensiveVisualizationGenerator._SOURCE_FILE_COLUMN:
+                continue
+            lowered = str(column).lower()
+            if any(token in lowered for token in ("id", "name", "address", "code")):
+                continue
+            unique_count = df[column].nunique(dropna=True)
+            if 2 <= unique_count <= 16:
+                return column
+        return None
+
+    @staticmethod
+    def _create_cross_file_record_chart(df: pd.DataFrame, filename: str) -> Tuple[Optional[str], Optional[str]]:
+        source_col = ComprehensiveVisualizationGenerator._SOURCE_FILE_COLUMN
+        if source_col not in df.columns or df[source_col].nunique(dropna=True) < 2:
+            return None, None
+
+        counts = df[source_col].astype(str).value_counts().sort_values(ascending=True)
+        fig = go.Figure(go.Bar(
+            x=counts.values,
+            y=counts.index,
+            orientation="h",
+            marker=dict(color="#0f766e"),
+            text=[f"{value:,}" for value in counts.values],
+            textposition="auto",
+        ))
+        fig.update_layout(
+            title="Uploaded File Coverage",
+            xaxis_title="Rows",
+            yaxis_title="Source file",
+            template="plotly_white",
+            height=max(520, 120 + len(counts) * 72),
+            showlegend=False,
+        )
+        return ComprehensiveVisualizationGenerator._save_chart(fig, filename)
+
+    @staticmethod
+    def _create_cross_file_metric_chart(df: pd.DataFrame, metric_col: str, filename: str) -> Tuple[Optional[str], Optional[str]]:
+        source_col = ComprehensiveVisualizationGenerator._SOURCE_FILE_COLUMN
+        if source_col not in df.columns or metric_col not in df.columns:
+            return None, None
+
+        working = df[[source_col, metric_col]].copy()
+        working[metric_col] = pd.to_numeric(working[metric_col], errors="coerce")
+        working = working.dropna(subset=[source_col, metric_col])
+        if working.empty or working[source_col].nunique() < 2:
+            return None, None
+
+        summary = (
+            working.groupby(source_col, dropna=False)[metric_col]
+            .agg(total="sum", average="mean", records="count")
+            .reset_index()
+            .sort_values("total", ascending=False)
+        )
+
+        fig = make_subplots(
+            rows=1,
+            cols=2,
+            subplot_titles=(f"Total {metric_col}", f"Average {metric_col}"),
+            horizontal_spacing=0.18,
+        )
+        fig.add_trace(go.Bar(
+            x=summary[source_col],
+            y=summary["total"],
+            marker_color="#2563eb",
+            name="Total",
+            text=[f"{value:,.0f}" for value in summary["total"]],
+            textposition="auto",
+            showlegend=False,
+        ), row=1, col=1)
+        fig.add_trace(go.Bar(
+            x=summary[source_col],
+            y=summary["average"],
+            marker_color="#f97316",
+            name="Average",
+            text=[f"{value:,.1f}" for value in summary["average"]],
+            textposition="auto",
+            showlegend=False,
+        ), row=1, col=2)
+        fig.update_layout(
+            title=f"Cross-File Metric Comparison: {metric_col}",
+            template="plotly_white",
+            height=660,
+            showlegend=False,
+        )
+        fig.update_xaxes(tickangle=36, automargin=True)
+        fig.update_yaxes(automargin=True)
+        return ComprehensiveVisualizationGenerator._save_chart(fig, filename)
+
+    @staticmethod
+    def _create_cross_file_category_chart(df: pd.DataFrame, category_col: str, filename: str) -> Tuple[Optional[str], Optional[str]]:
+        source_col = ComprehensiveVisualizationGenerator._SOURCE_FILE_COLUMN
+        if source_col not in df.columns or category_col not in df.columns:
+            return None, None
+
+        working = df[[source_col, category_col]].dropna().copy()
+        if working.empty or working[source_col].nunique() < 2:
+            return None, None
+
+        top_categories = working[category_col].astype(str).value_counts().head(8).index
+        working = working[working[category_col].astype(str).isin(top_categories)]
+        if working.empty:
+            return None, None
+
+        mix = pd.crosstab(working[source_col].astype(str), working[category_col].astype(str))
+        fig = go.Figure()
+        for category in mix.columns:
+            fig.add_trace(go.Bar(
+                x=mix.index,
+                y=mix[category],
+                name=str(category),
+            ))
+        fig.update_layout(
+            title=f"Cross-File Category Mix: {category_col}",
+            xaxis_title="Source file",
+            yaxis_title="Rows",
+            barmode="stack",
+            template="plotly_white",
+            height=680,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        )
+        fig.update_xaxes(tickangle=36, automargin=True)
+        return ComprehensiveVisualizationGenerator._save_chart(fig, filename)
+
+    @staticmethod
+    def _create_cross_file_charts(df: pd.DataFrame, chart_sequence: int, filename_prefix: str = "") -> Tuple[List[str], List[str], int]:
+        source_col = ComprehensiveVisualizationGenerator._SOURCE_FILE_COLUMN
+        if source_col not in df.columns or df[source_col].nunique(dropna=True) < 2:
+            return [], [], chart_sequence
+
+        png_paths: List[str] = []
+        html_paths: List[str] = []
+
+        def add_chart(result):
+            png_path, html_path = result
+            if png_path:
+                png_paths.append(png_path)
+            if html_path:
+                html_paths.append(html_path)
+
+        add_chart(ComprehensiveVisualizationGenerator._create_cross_file_record_chart(
+            df,
+            f"{filename_prefix}cross_file_records_{chart_sequence}",
+        ))
+        chart_sequence += 1
+
+        numeric_columns = ComprehensiveVisualizationGenerator._cross_file_numeric_columns(df)
+        if numeric_columns:
+            add_chart(ComprehensiveVisualizationGenerator._create_cross_file_metric_chart(
+                df,
+                numeric_columns[0],
+                f"{filename_prefix}cross_file_metric_{chart_sequence}",
+            ))
+            chart_sequence += 1
+
+        category_col = ComprehensiveVisualizationGenerator._cross_file_category_column(df)
+        if category_col:
+            add_chart(ComprehensiveVisualizationGenerator._create_cross_file_category_chart(
+                df,
+                category_col,
+                f"{filename_prefix}cross_file_category_mix_{chart_sequence}",
+            ))
+            chart_sequence += 1
+
+        return png_paths, html_paths, chart_sequence
+
 
     # ------------------------- Public chart creation -------------------------
     @staticmethod
-    def create_intelligent_charts(df: pd.DataFrame, plan: Dict[str, Any], analysis_results: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+    def create_intelligent_charts(
+        df: pd.DataFrame,
+        plan: Dict[str, Any],
+        analysis_results: Dict[str, Any],
+        filename_prefix: str = "",
+    ) -> Tuple[List[str], List[str]]:
         """Create comprehensive visualizations
         
         Returns:
@@ -126,6 +313,14 @@ class ComprehensiveVisualizationGenerator:
         try:
             # Truncate long categorical labels globally to prevent overlapping on axes
             df = df.copy()
+            cross_png, cross_html, chart_sequence = ComprehensiveVisualizationGenerator._create_cross_file_charts(
+                df,
+                chart_sequence,
+                filename_prefix=filename_prefix,
+            )
+            chart_paths_png.extend(cross_png)
+            chart_paths_html.extend(cross_html)
+
             for c in df.select_dtypes(include=['object', 'category']).columns:
                 df[c] = df[c].astype(str).apply(lambda x: x[:15] + '...' if len(x) > 15 else x)
 
@@ -138,7 +333,7 @@ class ComprehensiveVisualizationGenerator:
                 
                 if analysis_type == 'correlation_network':
                     png_path, html_path = ComprehensiveVisualizationGenerator._create_correlation_network_chart(
-                        analysis_result, f"correlation_network_{chart_sequence}")
+                        analysis_result, f"{filename_prefix}correlation_network_{chart_sequence}")
                     chart_sequence += 1
                     if png_path:
                         chart_paths_png.append(png_path)
@@ -147,7 +342,7 @@ class ComprehensiveVisualizationGenerator:
                 
                 elif analysis_type == 'time_series_decomposition':
                     png_path, html_path = ComprehensiveVisualizationGenerator._create_time_series_decomposition_chart(
-                        analysis_result, f"time_series_decomp_{chart_sequence}")
+                        analysis_result, f"{filename_prefix}time_series_decomp_{chart_sequence}")
                     chart_sequence += 1
                     if png_path:
                         chart_paths_png.append(png_path)
@@ -156,7 +351,7 @@ class ComprehensiveVisualizationGenerator:
                 
                 elif analysis_type == 'customer_segmentation':
                     png_path, html_path = ComprehensiveVisualizationGenerator._create_customer_segmentation_chart(
-                        analysis_result, f"customer_segments_{chart_sequence}")
+                        analysis_result, f"{filename_prefix}customer_segments_{chart_sequence}")
                     chart_sequence += 1
                     if png_path:
                         chart_paths_png.append(png_path)
@@ -165,7 +360,7 @@ class ComprehensiveVisualizationGenerator:
                 
                 elif analysis_type == 'anomaly_detection':
                     png_path, html_path = ComprehensiveVisualizationGenerator._create_anomaly_detection_chart(
-                        analysis_result, f"anomaly_detection_{chart_sequence}")
+                        analysis_result, f"{filename_prefix}anomaly_detection_{chart_sequence}")
                     chart_sequence += 1
                     if png_path:
                         chart_paths_png.append(png_path)
@@ -188,42 +383,42 @@ class ComprehensiveVisualizationGenerator:
                 
                 elif chart_type in ('time_series_line', 'line_chart') and len(columns) >= 2:
                     png_path, html_path = ComprehensiveVisualizationGenerator._create_time_series_line(
-                        df, columns[0], columns[1], f"time_series_{chart_sequence}", title)
+                        df, columns[0], columns[1], f"{filename_prefix}time_series_{chart_sequence}", title)
                     chart_sequence += 1
                  
                 elif chart_type == 'bar_chart' and len(columns) >= 2:
                     png_path, html_path = ComprehensiveVisualizationGenerator._create_bar_chart(
-                        df, columns[0], columns[1], f"bar_chart_{chart_sequence}", title)
+                        df, columns[0], columns[1], f"{filename_prefix}bar_chart_{chart_sequence}", title)
                     chart_sequence += 1
                  
                 elif chart_type == 'histogram' and len(columns) >= 1:
                     png_path, html_path = ComprehensiveVisualizationGenerator._create_histogram(
-                        df, columns[0], f"histogram_{chart_sequence}", title)
+                        df, columns[0], f"{filename_prefix}histogram_{chart_sequence}", title)
                     chart_sequence += 1
                  
                 elif chart_type == 'scatter_plot' and len(columns) >= 2:
                     png_path, html_path = ComprehensiveVisualizationGenerator._create_scatter_plot(
-                        df, columns[0], columns[1], f"scatter_{chart_sequence}", title)
+                        df, columns[0], columns[1], f"{filename_prefix}scatter_{chart_sequence}", title)
                     chart_sequence += 1
                  
                 elif chart_type == 'pie_chart' and len(columns) >= 1:
                     png_path, html_path = ComprehensiveVisualizationGenerator._create_pie_chart(
-                        df, columns[0], f"pie_chart_{chart_sequence}", title)
+                        df, columns[0], f"{filename_prefix}pie_chart_{chart_sequence}", title)
                     chart_sequence += 1
                  
                 elif chart_type == 'box_plot' and len(columns) >= 1:
                     png_path, html_path = ComprehensiveVisualizationGenerator._create_box_plot(
-                        df, columns, f"box_plot_{chart_sequence}", title)
+                        df, columns, f"{filename_prefix}box_plot_{chart_sequence}", title)
                     chart_sequence += 1
                  
                 elif chart_type == 'violin_plot' and len(columns) >= 2:
                     png_path, html_path = ComprehensiveVisualizationGenerator._create_violin_plot(
-                        df, columns[0], columns[1], f"violin_{chart_sequence}", title)
+                        df, columns[0], columns[1], f"{filename_prefix}violin_{chart_sequence}", title)
                     chart_sequence += 1
                  
                 elif chart_type == 'bubble_chart' and len(columns) >= 3:
                     png_path, html_path = ComprehensiveVisualizationGenerator._create_bubble_chart(
-                        df, columns[0], columns[1], columns[2], f"bubble_{chart_sequence}", title)
+                        df, columns[0], columns[1], columns[2], f"{filename_prefix}bubble_{chart_sequence}", title)
                     chart_sequence += 1
                  
                 if png_path:

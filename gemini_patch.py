@@ -6,8 +6,14 @@ from google import genai
 from google.genai.models import Models
 
 
-PRIMARY_MODEL_PREFIX = "gemini-2"
-FALLBACK_MODEL = "gemini-flash-latest"
+PRIMARY_MODEL_PREFIX = "gemini-"
+FALLBACK_CHAIN = [
+    "gemini-3.1-flash-lite",   # free tier primary
+    "gemini-3-flash",           # free tier secondary
+    "gemini-2.5-flash",         # legacy fallback
+    "gemini-flash-latest",      # last resort alias
+]
+FALLBACK_MODEL = FALLBACK_CHAIN[0]
 STREAMLIT_SECRET_KEYS = (
     "GEMINI_API_KEY",
     "GROQ_API_KEY",
@@ -95,20 +101,47 @@ def generate_content_with_model_fallback(
     api_key=None,
     retry_delay=2,
 ):
-    try:
-        request = {
-            "model": model,
-            "contents": contents,
-        }
+    # Build the chain: try requested model first, then walk FALLBACK_CHAIN
+    tried = [model]
+    chain = [m for m in FALLBACK_CHAIN if m != model] + []
+
+    def _try_model(m, use_v1beta=False):
+        key = api_key or os.getenv("GEMINI_API_KEY")
+        if use_v1beta:
+            c = genai.Client(api_key=key, http_options={"api_version": "v1beta"})
+        else:
+            c = client
+        request = {"model": m, "contents": contents}
         if config is not None:
             request["config"] = config
-        return client.models.generate_content(**request)
+        return c.models.generate_content(**request)
+
+    # Try primary model
+    try:
+        return _try_model(model)
     except Exception as error:
-        if _should_fallback(model, str(error)):
-            _safe_print(f"⚠️ {model} failed. Retrying chart analysis with {FALLBACK_MODEL}...")
-            time.sleep(retry_delay)
-            return _generate_with_v1_fallback(contents=contents, config=config, api_key=api_key)
-        raise
+        err_msg = str(error).upper()
+        is_quota = any(t in err_msg for t in ("429", "503", "LIMIT", "RESOURCE_EXHAUSTED", "UNAVAILABLE", "NOT_FOUND", "404"))
+        if not is_quota:
+            raise
+
+    # Walk fallback chain
+    for fallback in chain:
+        _safe_print(f"⚠️  {tried[-1]} failed → trying {fallback} ...")
+        tried.append(fallback)
+        time.sleep(retry_delay)
+        try:
+            return _try_model(fallback, use_v1beta=(fallback == "gemini-flash-latest"))
+        except Exception as error:
+            err_msg = str(error).upper()
+            is_quota = any(t in err_msg for t in ("429", "503", "LIMIT", "RESOURCE_EXHAUSTED", "UNAVAILABLE", "NOT_FOUND", "404"))
+            if not is_quota:
+                raise
+            continue
+
+    raise RuntimeError(f"All Gemini models exhausted: {tried}")
+
+
 
 
 def generate_content_with_fallback(self, *args, **kwargs):

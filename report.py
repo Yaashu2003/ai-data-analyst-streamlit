@@ -336,7 +336,9 @@ def _format_content_to_html(content_text: str, is_recommendation: bool) -> str:
     and selective bolding via markdown processing.
     """
     content_text = _strip_supporting_charts_section(content_text).strip()
-    
+    # Strip stray code-fence blocks (e.g. ```json ... ```) the AI may append
+    content_text = re.sub(r'```[\w]*\s*.*?```', '', content_text, flags=re.DOTALL).strip()
+
     # 1. Handle Bulleted Lists (Section 2: Key Insights & Drivers, Llama Report)
     if content_text.startswith('*'):
         # Pattern to find a bullet point: starts with *, followed by content, up to the next * or end of string.
@@ -406,9 +408,6 @@ def _render_chart_catalog_item(
         <h5>{display_name}</h5>
         <div class="chart-visual-wrapper">
             {visual_html}
-        </div>
-        <div class="chart-explanation">
-            <p>{explanation}</p>
         </div>
     </div>
     """
@@ -634,9 +633,6 @@ def generate_html_report(
                     <div class="chart-visual-wrapper">
                         {image_tag_1}
                     </div>
-                    <div class="chart-explanation">
-                        <p>{explanation_1}</p>
-                    </div>
                 </div>
                 """
                 
@@ -664,9 +660,6 @@ def generate_html_report(
                         <h5>{display_name_2}</h5>
                         <div class="chart-visual-wrapper">
                             {image_tag_2}
-                        </div>
-                        <div class="chart-explanation">
-                            <p>{explanation_2}</p>
                         </div>
                     </div>
                     """

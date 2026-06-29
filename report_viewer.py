@@ -44,7 +44,7 @@ def _generate_gemini_content_with_retry(client, prompt: str, system_instruction:
                 config["system_instruction"] = system_instruction
                 
             return client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-3.1-flash-lite",
                 contents=[prompt],
                 config=config
             )
@@ -199,6 +199,127 @@ def _resolve_chart_path(chart_name: str) -> Optional[Path]:
     return None
 
 
+def _inject_html_before_close(html: str, close_tag: str, injection: str) -> str:
+    lowered = (html or "").lower()
+    index = lowered.rfind(close_tag)
+    if index == -1:
+        return (html or "") + injection
+    return (html or "")[:index] + injection + (html or "")[index:]
+
+
+def _make_chart_srcdoc_responsive(chart_html: str) -> str:
+    marker = "codex-responsive-chart-srcdoc"
+    if marker in (chart_html or ""):
+        return chart_html or ""
+
+    injection = f"""
+<style id="{marker}">
+html, body {{ width: 100%; margin: 0; padding: 0; overflow: hidden; background: #fff; }}
+.plotly-graph-div,
+.js-plotly-plot,
+.svg-container {{
+    width: 100% !important;
+    max-width: 100% !important;
+    min-width: 0 !important;
+}}
+svg.main-svg {{ max-width: 100% !important; }}
+</style>
+<script>
+(function () {{
+    function resizeCharts() {{
+        if (!window.Plotly) return;
+        document.querySelectorAll('.js-plotly-plot, .plotly-graph-div').forEach(function (chart) {{
+            chart.style.width = '100%';
+            window.Plotly.Plots.resize(chart);
+        }});
+    }}
+    window.addEventListener('load', resizeCharts);
+    window.addEventListener('resize', resizeCharts);
+    setTimeout(resizeCharts, 150);
+}})();
+</script>
+"""
+    if "</head>" in (chart_html or "").lower():
+        return _inject_html_before_close(chart_html or "", "</head>", injection)
+    return injection + (chart_html or "")
+
+
+def _make_report_html_responsive(html_content: str) -> str:
+    """Apply responsive chart/report overrides to old and newly generated report HTML."""
+    soup = BeautifulSoup(html_content or "", "html.parser")
+
+    for existing in soup.find_all("style", id="codex-responsive-report-css"):
+        existing.decompose()
+
+    style = soup.new_tag("style", id="codex-responsive-report-css")
+    style.string = """
+.container {
+    max-width: min(1500px, 96vw) !important;
+}
+.report-section {
+    overflow: visible !important;
+}
+.chart-pair {
+    display: grid !important;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 620px), 1fr)) !important;
+    gap: 20px !important;
+    align-items: start !important;
+}
+.chart-item {
+    min-width: 0 !important;
+    overflow: hidden !important;
+}
+.chart-visual-wrapper {
+    overflow: hidden !important;
+    touch-action: auto !important;
+    padding-bottom: 0 !important;
+}
+.chart-visual-wrapper iframe,
+.chart-frame {
+    width: 100% !important;
+    max-width: 100% !important;
+    min-width: 0 !important;
+    height: clamp(540px, 58vh, 720px) !important;
+    border: 0 !important;
+    display: block !important;
+}
+.chart-visual-wrapper iframe[src*="Dashboard"],
+.chart-visual-wrapper iframe[src*="dashboard"],
+.chart-visual-wrapper iframe[src*="Category_Subplots"],
+.chart-visual-wrapper iframe[src*="Market_Composition_Treemap"],
+.chart-visual-wrapper iframe[src*="Top_10_Category_Bar"],
+.chart-visual-wrapper iframe[src*="anomaly_detection_"] {
+    height: clamp(620px, 66vh, 820px) !important;
+}
+.chart-visual-wrapper .plotly-graph-div,
+.chart-visual-wrapper .js-plotly-plot,
+.chart-visual-wrapper .svg-container {
+    width: 100% !important;
+    max-width: 100% !important;
+    min-width: 0 !important;
+}
+@media (max-width: 760px) {
+    .report-section { padding: 18px !important; }
+    .chart-visual-wrapper iframe,
+    .chart-frame {
+        height: 560px !important;
+    }
+}
+"""
+    if soup.head:
+        soup.head.append(style)
+    else:
+        soup.insert(0, style)
+
+    for iframe in soup.find_all("iframe"):
+        iframe["width"] = "100%"
+        iframe["style"] = "width:100%;max-width:100%;border:0;display:block;background:#fff;"
+        if iframe.get("srcdoc"):
+            iframe["srcdoc"] = _make_chart_srcdoc_responsive(iframe.get("srcdoc", ""))
+
+    return str(soup)
+
+
 def load_full_report_html():
     """Loads the main report HTML and embeds iframe charts using srcdoc."""
     if not REPORT_HTML.is_file(): return "<h3>No report generated yet.</h3>"
@@ -206,6 +327,7 @@ def load_full_report_html():
     html_content = REPORT_HTML.read_text(encoding="utf-8")
     soup = BeautifulSoup(html_content, "html.parser")
     for iframe in soup.find_all("iframe"):
+        iframe["loading"] = "lazy"
         src = iframe.get("src", "") or iframe.get("data-src", "")
         if not src: continue
         clean_src = src.replace("file://", "").replace("\\", "/").lstrip("/")
@@ -213,7 +335,7 @@ def load_full_report_html():
         chart_path = _resolve_chart_path(chart_name)
 
         if chart_path and chart_path.is_file():
-            chart_html = chart_path.read_text(encoding="utf-8")
+            chart_html = _make_chart_srcdoc_responsive(chart_path.read_text(encoding="utf-8"))
             lower_name = chart_name.lower()
             iframe_height = "920px" if any(token in lower_name for token in ["dashboard", "category_subplots", "treemap"]) else "780px"
             iframe["srcdoc"] = chart_html
@@ -224,7 +346,7 @@ def load_full_report_html():
             error_div = soup.new_tag("div")
             error_div.string = f"âš ï¸ Chart not available: {chart_name} (run analysis to generate charts)"
             iframe.replace_with(error_div)
-    return str(soup)
+    return _make_report_html_responsive(str(soup))
 
 def extract_text_from_html(html_content: str) -> str:
     """Extract readable text content from HTML report."""
@@ -510,27 +632,43 @@ def build_final_report_html_preserving_charts(
 
     report_section.clear()
     report_section.append(BeautifulSoup(rebuilt_html, "html.parser"))
-    return str(soup)
+    return _make_report_html_responsive(str(soup))
 
 
 # --- HITL: Identify human edits and generate per-edit feedback (text only; no graphs/images) ---
 
+_CHART_MARKER_RE = re.compile(r"---CHART_\d+---", re.IGNORECASE)
+
+
+def _strip_chart_markers(text: str) -> str:
+    """Remove ---CHART_N--- blocks and their metadata from text for comparison."""
+    text = re.sub(r"---CHART_\d+---.*?(?=---CHART_\d+---|\Z)", "", text, flags=re.DOTALL | re.IGNORECASE)
+    return text.strip()
+
+
+def _is_chart_block(text: str) -> bool:
+    """Return True if the block is a chart placeholder, not prose."""
+    return bool(_CHART_MARKER_RE.search(text or ""))
+
+
 def identify_human_edits(original_text: str, edited_text: str) -> List[Dict]:
     """
-    STEP 1 â€” Identify Human Edits.
-    Compare original and human-edited report; detect which sentences/phrases were modified.
-    Returns list of {"original": "...", "edited": "...", "feedback": ""} for text-only changes.
-    Chart placeholders (---CHART_N---) are treated as units; only their Explanation text is compared.
+    STEP 1 - Identify Human Edits.
+    Compare original and human-edited report text, detecting only meaningful prose changes.
+    Chart placeholders (---CHART_N---) are stripped before diffing so chart metadata
+    differences never pollute the human-edit list.
+    Returns list of {"original": "...", "edited": "...", "feedback": ""}.
     """
     if not (original_text or "").strip() or not (edited_text or "").strip():
         return []
-    orig = (original_text or "").strip()
-    edit = (edited_text or "").strip()
+
+    orig = _strip_chart_markers((original_text or "").strip())
+    edit = _strip_chart_markers((edited_text or "").strip())
+
     if orig == edit:
         return []
 
     edits: List[Dict] = []
-    # Split into lines for clearer "sentence" boundaries
     orig_lines = orig.splitlines()
     edit_lines = edit.splitlines()
     matcher = difflib.SequenceMatcher(None, orig_lines, edit_lines)
@@ -539,11 +677,21 @@ def identify_human_edits(original_text: str, edited_text: str) -> List[Dict]:
             continue
         orig_block = "\n".join(orig_lines[i1:i2]).strip()
         edit_block = "\n".join(edit_lines[j1:j2]).strip()
+
+        # Skip empty-on-both-sides and identical blocks
         if not orig_block and not edit_block:
             continue
-        # Skip pure whitespace or placeholder-only changes that don't change prose
         if orig_block == edit_block:
             continue
+
+        # Skip chart marker / metadata blocks
+        if _is_chart_block(orig_block) or _is_chart_block(edit_block):
+            continue
+
+        # Skip trivially short or whitespace-only diffs
+        if len((orig_block + edit_block).strip()) < 10:
+            continue
+
         edits.append({"original": orig_block, "edited": edit_block, "feedback": ""})
     return edits
 
@@ -574,7 +722,7 @@ Edits:
         payload = json.dumps([{"original": e.get("original", ""), "edited": e.get("edited", "")} for e in edits])
         
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model="gemini-3.1-flash-lite",
             contents=[prompt + payload],
             config={"temperature": 0.2}
         )
@@ -1154,10 +1302,14 @@ def initialize_report_editing_state():
         st.session_state.report_feedback_dialog_text = ""
     if 'last_selection_timestamp' not in st.session_state:
         st.session_state.last_selection_timestamp = 0
+    if 'last_edit_timestamp' not in st.session_state:
+        st.session_state.last_edit_timestamp = 0
     if 'report_feedback_input_pending_reset' not in st.session_state:
         st.session_state.report_feedback_input_pending_reset = False
     if 'report_feedback_input_nonce' not in st.session_state:
         st.session_state.report_feedback_input_nonce = 0
+    if 'report_fullscreen_open' not in st.session_state:
+        st.session_state.report_fullscreen_open = False
 
 
 def _current_report_mtime() -> Optional[float]:
@@ -1564,6 +1716,76 @@ def _run_report_regeneration(success_prefix: str) -> None:
     st.success(message)
     st.rerun()
 
+
+def _handle_report_selection(sel_data) -> None:
+    if not sel_data:
+        return
+
+    event_type = sel_data.get("type", "selection")  # backwards-compat default
+
+    # ── Inline edit event: user edited text directly in the report ──
+    if event_type == "edit":
+        edited_text = sel_data.get("edited_text", "")
+        edit_ts = sel_data.get("edit_timestamp", 0)
+        if edited_text and edit_ts != st.session_state.get("last_edit_timestamp", 0):
+            st.session_state.last_edit_timestamp = edit_ts
+            st.session_state.report_edited_text = edited_text
+            st.session_state.plain_editor = edited_text
+        return
+
+    # ── Selection event: user right-clicked selected text for feedback ──
+    current_text = sel_data.get("text", "")
+    current_ts = sel_data.get("timestamp", 0)
+    if current_text and current_ts != st.session_state.last_selection_timestamp:
+        st.session_state.last_selection_timestamp = current_ts
+        st.session_state.report_feedback_dialog_text = current_text
+        st.session_state.report_feedback_dialog_open = True
+        _queue_feedback_input_reset()
+
+
+def _render_selectable_report_preview(report_html: str, height: int = 900, key: str = "report_html_text_selector") -> None:
+    component_path = _BASE_DIR / "st_text_selector"
+    try:
+        text_selector = declare_component("text_selector", path=str(component_path))
+        sel_data = text_selector(
+            html=_make_report_html_responsive(report_html),
+            height=height,
+            key=key,
+        )
+        _handle_report_selection(sel_data)
+    except Exception:
+        components.html(_make_report_html_responsive(report_html), height=height, scrolling=True)
+
+
+def _render_fullscreen_report_dialog(report_html: str) -> None:
+    @st.dialog("Full-screen report", width="large")
+    def fullscreen_dialog():
+        st.markdown(
+            """
+<style>
+div[data-testid="stDialog"],
+div[role="dialog"] {
+    width: min(96vw, 1700px) !important;
+    max-width: min(96vw, 1700px) !important;
+}
+div[data-testid="stDialog"] > div,
+div[role="dialog"] > div {
+    max-height: 94vh !important;
+}
+</style>
+""",
+            unsafe_allow_html=True,
+        )
+        # Reset the flag so the native × close button works correctly.
+        # The dialog being open IS the state; the flag is just a trigger.
+        st.session_state.report_fullscreen_open = False
+        st.caption("Full-screen report preview")
+        components.html(_make_report_html_responsive(report_html), height=820, scrolling=True)
+
+
+    fullscreen_dialog()
+
+
 def render_report_editing_ui():
     """Render the editing and feedback UI for the report."""
     st.markdown("---")
@@ -1703,7 +1925,13 @@ def render_report_editing_ui():
             st.session_state.report_feedback_dialog_open = True
             _queue_feedback_input_reset()
 
-    if st.session_state.get("report_feedback_dialog_open") and st.session_state.get("report_feedback_dialog_text"):
+    # Only open the feedback dialog when the fullscreen dialog is NOT already open.
+    # Streamlit allows only one @st.dialog to be open per script run.
+    if (
+        st.session_state.get("report_feedback_dialog_open")
+        and st.session_state.get("report_feedback_dialog_text")
+        and not st.session_state.get("report_fullscreen_open")
+    ):
         feedback_dialog()
 
     st.markdown(
@@ -1721,8 +1949,8 @@ def render_report_editing_ui():
         for i, sf in enumerate(st.session_state.report_sentence_feedbacks):
             col1, col2 = st.columns([4.5, 1], gap="medium")
             with col1:
-                st.write(f"**Text:** \"{sf['text'][:160]}\"")
-                st.write(f"**Feedback:** {sf['feedback']}")
+                st.write(f'**Text:** \"{sf["text"][:160]}\"')
+                st.write(f'**Feedback:** {sf["feedback"]}')
             with col2:
                 if st.button("Remove", key=f"report_remove_sf_{i}", width="stretch"):
                     st.session_state.report_sentence_feedbacks.pop(i)
@@ -2043,26 +2271,48 @@ def render_report_tab(report_ready_key, report_visible_key):
         st.info("No report generated yet. Run analysis first.")
         return
 
-    tab1, tab2, tab3 = st.tabs([
-        "View Report",
-        "Edit and Feedback",
-        "Final Report"
-    ])
+    report_view_mode = st.radio(
+        "Report workflow",
+        ["View Report", "Edit and Feedback", "Final Report"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="report_view_mode",
+    )
+
+    current_report_html = (
+        st.session_state.get("report_final_html")
+        or st.session_state.get("report_original_html")
+        or load_full_report_html()
+    )
 
     if st.session_state.get("mode") in {"dataset", "pbix"}:
         from chatbot_conversation import display_chatbot
 
-        with st.popover("Ask about your report", width="stretch"):
-            st.caption(
-                "Use the generated report text and extracted charts for follow-up questions while you review the report."
-            )
-            display_chatbot()
+        _, report_action_col = st.columns([3.2, 1], gap="large")
+        with report_action_col:
+            with st.popover("Ask about your report", width="stretch"):
+                st.caption(
+                    "Use the generated report text and extracted charts for follow-up questions while you review the report."
+                )
+                display_chatbot()
+            if st.button("Open full-screen report", width="stretch", key="report_fullscreen_btn"):
+                st.session_state.report_fullscreen_open = True
+                st.rerun()
 
-    with tab1:
+    # Only open the fullscreen dialog when the feedback dialog is NOT also queued.
+    # Streamlit allows only one @st.dialog to be open per script run.
+    feedback_also_queued = (
+        st.session_state.get("report_feedback_dialog_open")
+        and st.session_state.get("report_feedback_dialog_text")
+    )
+    if st.session_state.get("report_fullscreen_open") and not feedback_also_queued:
+        _render_fullscreen_report_dialog(current_report_html)
+
+    if report_view_mode == "View Report":
         btn_label = (
             "Open Dataset Chat Workspace"
             if st.session_state.get("mode") == "dataset"
-            else "Open Power BI Chart Workspace"
+            else "Open BI Chart Workspace"
         )
         if st.button(
             btn_label,
@@ -2076,14 +2326,15 @@ def render_report_tab(report_ready_key, report_visible_key):
                 with st.popover("💬 Ask about your report", width="stretch"):
             """
         st.markdown("---")
-        final_html = st.session_state.get("report_final_html") or load_full_report_html()
-        components.html(final_html, height=900, scrolling=True)
+        components.html(_make_report_html_responsive(current_report_html), height=900, scrolling=True)
 
-    with tab2:
+    elif report_view_mode == "Edit and Feedback":
         if st.session_state.report_original_text:
-            st.markdown("### Edit and Feedback")
-
-            report_html = st.session_state.get("report_final_html") or load_full_report_html()
+            report_html = (
+                st.session_state.get("report_final_html")
+                or st.session_state.get("report_original_html")
+                or load_full_report_html()
+            )
             current_text = st.session_state.report_edited_text or st.session_state.report_original_text
 
             if not st.session_state.report_editors_initialized:
@@ -2093,37 +2344,10 @@ def render_report_tab(report_ready_key, report_visible_key):
             def _sync():
                 _sync_report_text_from_editor(clear_dependent_state=True)
 
-            preview_col, editor_col = st.columns([1.15, 1], gap="large")
-            with preview_col:
-                st.markdown(
-                    """
-<div class="report-feedback-card">
-    <h4>Live report preview</h4>
-    <p>Select any sentence or paragraph from the preview, queue rewrite feedback, and keep the visuals anchored while you refine the narrative.</p>
-</div>
-""",
-                    unsafe_allow_html=True,
-                )
-                components.html(report_html, height=860, scrolling=True)
-
-            with editor_col:
-                st.markdown(
-                    """
-<div class="report-feedback-card">
-    <h4>Draft editor</h4>
-    <p>Update the wording here. When you regenerate, this edited draft becomes the base for the final report and the embedded charts stay preserved.</p>
-</div>
-""",
-                    unsafe_allow_html=True,
-                )
-                _apply_pending_editor_refresh()
-                st.text_area(
-                    "Edit report text:",
-                    value=st.session_state.plain_editor,
-                    height=620,
-                    key="plain_editor_main",
-                    on_change=_sync
-                )
+            # ── Report is directly editable in the viewer below ─────────
+            # The st_text_selector component now supports contenteditable;
+            # right-click sends sentence feedback, typing sends edited_text.
+            _render_selectable_report_preview(report_html, height=950, key="report_edit_selectable_preview")
 
             st.markdown("---")
 
@@ -2131,7 +2355,7 @@ def render_report_tab(report_ready_key, report_visible_key):
         else:
             st.info("Report content is not loaded yet.")
 
-    with tab3:
+    else:
         final_text = st.session_state.report_final_text
 
         if not final_text:
@@ -2151,7 +2375,7 @@ def render_report_tab(report_ready_key, report_visible_key):
             )
 
         if display_html:
-            components.html(display_html, height=900, scrolling=True)
+            components.html(_make_report_html_responsive(display_html), height=900, scrolling=True)
         else:
             st.markdown(final_text)
 

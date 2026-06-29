@@ -34,7 +34,14 @@ class IntelligentAnalysisOrchestrator:
                     except OSError:
                         pass
 
-    def analyze_dataset(self, df: pd.DataFrame, dataset_name: str = "Dataset") -> Dict[str, Any]:
+    def analyze_dataset(
+        self,
+        df: pd.DataFrame,
+        dataset_name: str = "Dataset",
+        clear_outputs: bool = True,
+        generate_insights: bool = True,
+        filename_prefix: str = "",
+    ) -> Dict[str, Any]:
         print(f"\nStarting intelligent analysis of {dataset_name}")
         print(f"Dataset: {df.shape[0]:,} rows x {df.shape[1]} columns")
 
@@ -65,11 +72,13 @@ class IntelligentAnalysisOrchestrator:
             state["current_step"] = "analysis_done"
 
             print("\nGenerating charts...")
-            self._clear_generated_chart_outputs()
+            if clear_outputs:
+                self._clear_generated_chart_outputs()
             chart_paths, chart_paths_html = ComprehensiveVisualizationGenerator.create_intelligent_charts(
                 df,
                 state["analysis_plan"],
                 state["specialized_analyses"],
+                filename_prefix=filename_prefix,
             )
             state["chart_paths"] = list(chart_paths or [])
             if chart_paths_html:
@@ -86,6 +95,7 @@ class IntelligentAnalysisOrchestrator:
                 df,
                 dataset_name,
                 existing_chart_stems=intelligent_stems,
+                filename_prefix=filename_prefix,
             )
             if autoviz_charts:
                 state["chart_paths"].extend(autoviz_charts)
@@ -110,7 +120,9 @@ class IntelligentAnalysisOrchestrator:
                 )
 
             print("\nGenerating insights...")
-            if not state["chart_paths"]:
+            if not generate_insights:
+                print("Insight generation deferred for multi-dataset selection.")
+            elif not state["chart_paths"]:
                 print("No charts found -> skipping insight generation")
             else:
                 state["insights"] = self.insight_generator.generate_comprehensive_insights(state)

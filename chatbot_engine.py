@@ -1,14 +1,15 @@
 import gemini_patch
 import os
-import sqlite3
 import json
 import uuid
 import re
 import difflib
+from pathlib import Path
 from html import escape
 import pandas as pd
 import streamlit as st
 import plotly.express as px
+import duckdb
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
@@ -27,7 +28,7 @@ load_dotenv(override=True)
 # ---------------------------
 _GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("API_KEY")
 gemini_client = genai.Client(api_key=_GEMINI_API_KEY) if _GEMINI_API_KEY else None
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.1-flash-lite"
 
 GENERIC_QUERY_TOKENS = {
     "a", "an", "and", "are", "brand", "brands", "by", "for", "from", "in", "is",
@@ -39,6 +40,22 @@ ANALYSIS_QUERY_TOKENS = {
     "overview", "summary", "trend", "trends",
 }
 
+SOURCE_FILE_COLUMN = "source_file"
+DATASET_INPUT_DIR = Path(__file__).resolve().parent / "dataset_input"
+DATASET_MANIFEST = DATASET_INPUT_DIR / "manifest.json"
+DATA_PATH = Path(__file__).resolve().parent / "Superstore.csv"
+MULTI_FILE_QUERY_TOKENS = {
+    "csv", "csvs", "dataset", "datasets", "file", "files", "input", "inputs",
+    "source", "sources", "upload", "uploaded", "compare", "comparison",
+}
+
+DATA_QUERY_TOKENS = {
+    "chart", "compare", "count", "average", "avg", "sum", "total", "top",
+    "bottom", "trend", "rank", "ranking", "highest", "lowest", "best", "worst",
+    "branch", "branches", "recovery", "performance", "recommendation",
+    "recommendations", "risk", "risks", "insight", "insights",
+}
+
 
 def _normalize_text_token(value: Any) -> str:
     return re.sub(r"[^a-z0-9]+", " ", str(value).strip().lower()).strip()
@@ -46,6 +63,118 @@ def _normalize_text_token(value: Any) -> str:
 
 def _sql_quote(value: str) -> str:
     return "'" + str(value).replace("'", "''") + "'"
+
+
+def _duckdb_identifier(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _safe_table_name(file_name: str, index: int) -> str:
+    stem = Path(str(file_name or f"dataset_{index + 1}")).stem.lower()
+    safe = re.sub(r"[^a-z0-9]+", "_", stem).strip("_")
+    if not safe:
+        safe = f"dataset_{index + 1}"
+    if re.match(r"^\d", safe):
+        safe = f"dataset_{safe}"
+    return f"csv_{index + 1}_{safe[:42]}"
+
+
+def _read_dataset_manifest() -> Dict[str, Any]:
+    if not DATASET_MANIFEST.exists():
+        return {}
+    try:
+        return json.loads(DATASET_MANIFEST.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _read_table_file(path: str) -> pd.DataFrame:
+    table_path = Path(path)
+    if table_path.suffix.lower() in {".xlsx", ".xls"}:
+        return pd.read_excel(table_path)
+    return pd.read_csv(table_path, encoding="latin1")
+
+
+def _load_combined_dataset_from_manifest() -> Optional[pd.DataFrame]:
+    """Build the chatbot bridge table from the uploaded source files, not from disk fallback."""
+    manifest = _read_dataset_manifest()
+    files = manifest.get("files", [])
+    if not files:
+        return None
+
+    frames = []
+    for index, item in enumerate(files):
+        file_name = item.get("name") or f"dataset_{index + 1}"
+        file_path = item.get("path")
+        if not file_path or not Path(file_path).exists():
+            continue
+
+        frame = _read_table_file(file_path).copy()
+        frame[SOURCE_FILE_COLUMN] = file_name
+        frame["source_row_number"] = range(1, len(frame) + 1)
+        frames.append(frame)
+
+    if not frames:
+        return None
+    return pd.concat(frames, ignore_index=True, sort=False)
+
+
+def _sample_table_context(frame: pd.DataFrame, max_columns: int = 16) -> Dict[str, Any]:
+    numeric_summary = {}
+    for column in frame.select_dtypes(include="number").columns[:6]:
+        series = frame[column].dropna()
+        if series.empty:
+            continue
+        numeric_summary[column] = {
+            "min": float(series.min()),
+            "max": float(series.max()),
+            "mean": round(float(series.mean()), 3),
+        }
+
+    categorical_examples = {}
+    for column in frame.select_dtypes(include=["object", "category", "string"]).columns[:8]:
+        values = (
+            frame[column].dropna().astype(str).str.strip().loc[lambda s: s.ne("")]
+            .value_counts().head(5).index.tolist()
+        )
+        if values:
+            categorical_examples[column] = values
+
+    return {
+        "columns": list(frame.columns)[:max_columns],
+        "row_count": int(len(frame)),
+        "sample_rows": frame.head(3).fillna("").astype(str).to_dict(orient="records"),
+        "numeric_summary": numeric_summary,
+        "categorical_examples": categorical_examples,
+    }
+
+
+def _strip_sql_fences(sql: str) -> str:
+    clean = (sql or "").strip()
+    if clean.startswith("```"):
+        clean = clean.strip("`").strip()
+        if clean.lower().startswith("sql"):
+            clean = clean[3:].strip()
+    lowered = clean.lower()
+    if lowered.startswith(("select", "with")):
+        pass
+    elif "with" in lowered and ("select" not in lowered or lowered.index("with") < lowered.index("select")):
+        clean = clean[lowered.index("with"):]
+    elif "select" in lowered:
+        clean = clean[lowered.index("select"):]
+    return clean.strip().rstrip(";")
+
+
+def _is_safe_select_sql(sql: str) -> bool:
+    cleaned = (sql or "").strip().lower()
+    if not (cleaned.startswith("select") or cleaned.startswith("with")):
+        return False
+    blocked = (
+        " insert ", " update ", " delete ", " drop ", " alter ", " create ",
+        " attach ", " detach ", " copy ", " pragma ", " call ", " export ",
+    )
+    padded = f" {cleaned} "
+    return not any(token in padded for token in blocked)
 
 
 def _collect_candidate_filters(frame: pd.DataFrame, limit: int = 40) -> Dict[str, set[str]]:
@@ -110,6 +239,7 @@ def _best_query_match(query: str, values: set[str]) -> Optional[str]:
 
 def _infer_target_dimension(query: str, available_columns: list[str]) -> Optional[str]:
     dimension_aliases = {
+        SOURCE_FILE_COLUMN: ["source file", "source", "file", "files", "csv", "csvs", "dataset", "datasets", "upload", "uploads"],
         "brand": ["brand", "brands"],
         "category": ["category", "categories"],
         "source": ["source", "sources", "channel", "channels", "platform", "platforms"],
@@ -125,6 +255,279 @@ def _infer_target_dimension(query: str, available_columns: list[str]) -> Optiona
         alias_match = _best_query_match(query, {_normalize_text_token(alias) for alias in aliases})
         if alias_match:
             return column
+    return None
+
+
+def _query_mentions_multi_file(query: str, frame: pd.DataFrame) -> bool:
+    if frame is None or SOURCE_FILE_COLUMN not in frame.columns:
+        return False
+    if frame[SOURCE_FILE_COLUMN].nunique(dropna=True) < 2:
+        return False
+    return any(token in query for token in MULTI_FILE_QUERY_TOKENS)
+
+
+def _metric_alias(column: str, prefix: str) -> str:
+    cleaned = re.sub(r"[^a-z0-9]+", "_", str(column).strip().lower()).strip("_")
+    return f"{prefix}_{cleaned or 'value'}"
+
+
+def _metric_column_for_query(query: str, frame: pd.DataFrame) -> Optional[str]:
+    if frame is None or frame.empty:
+        return None
+
+    if any(phrase in query for phrase in ["record count", "row count", "rows count", "number of records", "how many records"]):
+        return None
+
+    numeric_cols = [
+        column for column in frame.select_dtypes(include="number").columns
+        if not any(token in str(column).lower() for token in ["id", "row", "postal", "zip", "pincode", "code"])
+    ]
+    if not numeric_cols:
+        return None
+
+    metric_tokens = [
+        "sales", "revenue", "gmv", "amount", "profit", "margin", "price",
+        "cost", "quantity", "qty", "orders", "count", "value", "score",
+    ]
+    for token in metric_tokens:
+        if token not in query:
+            continue
+        for column in numeric_cols:
+            if token in str(column).lower():
+                return column
+
+    return numeric_cols[0]
+
+
+def _should_force_sql_intent(user_msg: str) -> bool:
+    query = _normalize_text_token(user_msg)
+    return any(token in query for token in DATA_QUERY_TOKENS)
+
+
+def _manifest_table_name_for(*keywords: str) -> Optional[str]:
+    """Find the registered DuckDB table for an uploaded source file by filename keywords."""
+    lowered_keywords = [keyword.lower() for keyword in keywords if keyword]
+    for item in (query_context or {}).get("source_files", []):
+        haystack = f"{item.get('file_name', '')} {item.get('table_name', '')}".lower()
+        if all(keyword in haystack for keyword in lowered_keywords):
+            return item.get("table_name")
+    return None
+
+
+def _build_specialized_duckdb_sql(user_msg: str) -> Optional[str]:
+    query = _normalize_text_token(user_msg)
+    wants_branch = "branch" in query or "branches" in query
+    wants_recovery = "recovery" in query or "recoveries" in query
+    wants_performance = "performance" in query or "achievement" in query
+    wants_top_bottom = "top" in query and "bottom" in query
+    wants_bottom_percent = "bottom" in query and ("10" in query or "percent" in query or "pct" in query)
+    wants_anomaly_count = "anomaly" in query and ("count" in query or "counts" in query or "high" in query)
+
+    if wants_branch and wants_recovery and wants_performance and wants_bottom_percent and wants_anomaly_count:
+        performance_table = _manifest_table_name_for("branch", "performance")
+        recovery_table = _manifest_table_name_for("recovery") or _manifest_table_name_for("collections")
+        if performance_table and recovery_table:
+            performance_source = _duckdb_identifier(performance_table)
+            recovery_source = _duckdb_identifier(recovery_table)
+        else:
+            performance_source = recovery_source = '"sales"'
+
+        return f"""
+WITH performance_by_branch AS (
+    SELECT
+        "branch",
+        AVG(CAST("achievement_pct" AS DOUBLE)) AS "avg_achievement_pct",
+        AVG(CAST("net_deposit_cr" AS DOUBLE)) AS "avg_net_deposit_cr",
+        AVG(CAST("npa_amount_cr" AS DOUBLE)) AS "avg_npa_amount_cr"
+    FROM {performance_source}
+    WHERE "branch" IS NOT NULL
+      AND "achievement_pct" IS NOT NULL
+    GROUP BY "branch"
+),
+performance_cutoff AS (
+    SELECT QUANTILE_CONT("avg_achievement_pct", 0.10) AS "bottom_10_cutoff"
+    FROM performance_by_branch
+),
+recovery_rows AS (
+    SELECT
+        "branch",
+        CAST("recovery_rate_pct" AS DOUBLE) AS "recovery_rate_pct",
+        CAST("amount_recovered" AS DOUBLE) AS "amount_recovered",
+        CAST("dpd" AS DOUBLE) AS "dpd",
+        CAST("collateral_value" AS DOUBLE) AS "collateral_value",
+        CAST("credit_score" AS DOUBLE) AS "credit_score",
+        CAST("contact_attempts" AS DOUBLE) AS "contact_attempts"
+    FROM {recovery_source}
+    WHERE "branch" IS NOT NULL
+),
+recovery_stats AS (
+    SELECT
+        AVG("recovery_rate_pct") AS "avg_recovery_rate_pct_all",
+        STDDEV_SAMP("recovery_rate_pct") AS "std_recovery_rate_pct",
+        AVG("amount_recovered") AS "avg_amount_recovered_all",
+        STDDEV_SAMP("amount_recovered") AS "std_amount_recovered",
+        AVG("dpd") AS "avg_dpd_all",
+        STDDEV_SAMP("dpd") AS "std_dpd",
+        AVG("collateral_value") AS "avg_collateral_value_all",
+        STDDEV_SAMP("collateral_value") AS "std_collateral_value",
+        AVG("credit_score") AS "avg_credit_score_all",
+        STDDEV_SAMP("credit_score") AS "std_credit_score",
+        AVG("contact_attempts") AS "avg_contact_attempts_all",
+        STDDEV_SAMP("contact_attempts") AS "std_contact_attempts"
+    FROM recovery_rows
+),
+recovery_scored_rows AS (
+    SELECT
+        rr.*,
+        (
+            CASE WHEN rs."std_recovery_rate_pct" > 0 AND ABS(rr."recovery_rate_pct" - rs."avg_recovery_rate_pct_all") / rs."std_recovery_rate_pct" >= 2 THEN 1 ELSE 0 END +
+            CASE WHEN rs."std_amount_recovered" > 0 AND ABS(rr."amount_recovered" - rs."avg_amount_recovered_all") / rs."std_amount_recovered" >= 2 THEN 1 ELSE 0 END +
+            CASE WHEN rs."std_dpd" > 0 AND ABS(rr."dpd" - rs."avg_dpd_all") / rs."std_dpd" >= 2 THEN 1 ELSE 0 END +
+            CASE WHEN rs."std_collateral_value" > 0 AND ABS(rr."collateral_value" - rs."avg_collateral_value_all") / rs."std_collateral_value" >= 2 THEN 1 ELSE 0 END +
+            CASE WHEN rs."std_credit_score" > 0 AND ABS(rr."credit_score" - rs."avg_credit_score_all") / rs."std_credit_score" >= 2 THEN 1 ELSE 0 END +
+            CASE WHEN rs."std_contact_attempts" > 0 AND ABS(rr."contact_attempts" - rs."avg_contact_attempts_all") / rs."std_contact_attempts" >= 2 THEN 1 ELSE 0 END
+        ) AS "row_anomaly_count"
+    FROM recovery_rows rr
+    CROSS JOIN recovery_stats rs
+),
+recovery_anomalies_by_branch AS (
+    SELECT
+        "branch",
+        COUNT(*) AS "collection_case_count",
+        SUM("row_anomaly_count") AS "anomaly_count",
+        SUM(CASE WHEN "row_anomaly_count" > 0 THEN 1 ELSE 0 END) AS "anomalous_case_count",
+        AVG("recovery_rate_pct") AS "avg_recovery_rate_pct",
+        AVG("amount_recovered") AS "avg_amount_recovered",
+        AVG("dpd") AS "avg_dpd"
+    FROM recovery_scored_rows
+    GROUP BY "branch"
+),
+anomaly_cutoff AS (
+    SELECT QUANTILE_CONT("anomaly_count", 0.75) AS "high_anomaly_cutoff"
+    FROM recovery_anomalies_by_branch
+),
+joined AS (
+    SELECT
+        p."branch",
+        p."avg_achievement_pct",
+        p."avg_net_deposit_cr",
+        p."avg_npa_amount_cr",
+        r."collection_case_count",
+        r."anomaly_count",
+        r."anomalous_case_count",
+        r."avg_recovery_rate_pct",
+        r."avg_amount_recovered",
+        r."avg_dpd",
+        pc."bottom_10_cutoff",
+        ac."high_anomaly_cutoff",
+        p."avg_achievement_pct" <= pc."bottom_10_cutoff" AS "bottom_10_performance",
+        r."anomaly_count" >= ac."high_anomaly_cutoff" AS "high_anomaly_count"
+    FROM performance_by_branch p
+    JOIN recovery_anomalies_by_branch r ON p."branch" = r."branch"
+    CROSS JOIN performance_cutoff pc
+    CROSS JOIN anomaly_cutoff ac
+),
+flagged AS (
+    SELECT
+        *,
+        ("bottom_10_performance" AND "high_anomaly_count") AS "appears_in_both",
+        CASE
+            WHEN "bottom_10_performance" AND "high_anomaly_count" THEN 'Exact overlap: bottom performance and high recovery anomalies'
+            WHEN "bottom_10_performance" THEN 'Bottom performance only'
+            WHEN "high_anomaly_count" THEN 'High recovery anomaly count only'
+            ELSE 'Near miss / context'
+        END AS "overlap_status"
+    FROM joined
+)
+SELECT
+    "overlap_status",
+    "appears_in_both",
+    "branch",
+    "avg_achievement_pct",
+    "bottom_10_cutoff",
+    "anomaly_count",
+    "high_anomaly_cutoff",
+    "anomalous_case_count",
+    "collection_case_count",
+    "avg_recovery_rate_pct",
+    "avg_amount_recovered",
+    "avg_dpd",
+    "avg_net_deposit_cr",
+    "avg_npa_amount_cr"
+FROM flagged
+WHERE "appears_in_both"
+   OR "bottom_10_performance"
+   OR "high_anomaly_count"
+ORDER BY "appears_in_both" DESC, "bottom_10_performance" DESC, "high_anomaly_count" DESC, "anomaly_count" DESC, "avg_achievement_pct" ASC
+""".strip()
+
+    if wants_branch and wants_recovery and wants_performance and wants_top_bottom:
+        return """
+WITH branch_metrics AS (
+    SELECT
+        "branch",
+        AVG(CAST("achievement_pct" AS DOUBLE)) AS "avg_achievement_pct",
+        AVG(CAST("recovery_rate_pct" AS DOUBLE)) AS "avg_recovery_rate_pct",
+        AVG(CAST("net_deposit_cr" AS DOUBLE)) AS "avg_net_deposit_cr",
+        AVG(CAST("amount_recovered" AS DOUBLE)) AS "avg_amount_recovered",
+        AVG(CAST("npa_amount_cr" AS DOUBLE)) AS "avg_npa_amount_cr",
+        AVG(CAST("achievement_pct" AS DOUBLE)) + AVG(CAST("recovery_rate_pct" AS DOUBLE)) AS "composite_score"
+    FROM "sales"
+    WHERE "branch" IS NOT NULL
+    GROUP BY "branch"
+    HAVING "avg_achievement_pct" IS NOT NULL
+       AND "avg_recovery_rate_pct" IS NOT NULL
+),
+ranked AS (
+    SELECT
+        *,
+        ROW_NUMBER() OVER (ORDER BY "composite_score" DESC) AS "top_rank",
+        ROW_NUMBER() OVER (ORDER BY "composite_score" ASC) AS "bottom_rank"
+    FROM branch_metrics
+),
+final_rows AS (
+    SELECT
+        0 AS "sort_group",
+        'Top 5' AS "branch_group",
+        "top_rank" AS "display_rank",
+        "branch",
+        "avg_achievement_pct",
+        "avg_recovery_rate_pct",
+        "avg_net_deposit_cr",
+        "avg_amount_recovered",
+        "avg_npa_amount_cr",
+        "composite_score"
+    FROM ranked
+    WHERE "top_rank" <= 5
+    UNION ALL
+    SELECT
+        1 AS "sort_group",
+        'Bottom 5' AS "branch_group",
+        "bottom_rank" AS "display_rank",
+        "branch",
+        "avg_achievement_pct",
+        "avg_recovery_rate_pct",
+        "avg_net_deposit_cr",
+        "avg_amount_recovered",
+        "avg_npa_amount_cr",
+        "composite_score"
+    FROM ranked
+    WHERE "bottom_rank" <= 5
+)
+SELECT
+    "branch_group",
+    "display_rank",
+    "branch",
+    "avg_achievement_pct",
+    "avg_recovery_rate_pct",
+    "avg_net_deposit_cr",
+    "avg_amount_recovered",
+    "avg_npa_amount_cr",
+    "composite_score"
+FROM final_rows
+ORDER BY "sort_group", "display_rank"
+""".strip()
+
     return None
 
 
@@ -166,8 +569,9 @@ def _build_heuristic_sql(user_msg: str, frame: pd.DataFrame) -> Optional[str]:
     wants_bottom = "bottom" in query
     sort_direction = "ASC" if wants_bottom else "DESC"
     wants_analysis = any(token in query for token in ANALYSIS_QUERY_TOKENS)
+    wants_source_comparison = _query_mentions_multi_file(query, frame)
 
-    target_dimension = _infer_target_dimension(query, list(frame.columns))
+    target_dimension = SOURCE_FILE_COLUMN if wants_source_comparison else _infer_target_dimension(query, list(frame.columns))
     filter_clauses, matched_filters = _resolve_query_filters(query, frame, target_dimension=target_dimension)
     filter_columns = set(matched_filters)
 
@@ -190,13 +594,12 @@ def _build_heuristic_sql(user_msg: str, frame: pd.DataFrame) -> Optional[str]:
 
     metric_expr = 'COUNT(*)'
     metric_alias = "record_count"
-    query_has_sales_words = any(token in query for token in ["sales", "revenue", "gmv", "value"])
-    if query_has_sales_words and "price" in frame.columns:
-        metric_expr = 'SUM(CAST("price" AS REAL))'
-        metric_alias = "total_price"
-    elif "price" in query and "price" in frame.columns:
-        metric_expr = 'AVG(CAST("price" AS REAL))'
-        metric_alias = "avg_price"
+    metric_column = _metric_column_for_query(query, frame)
+    wants_average = any(token in query for token in ["avg", "average", "mean"])
+    if metric_column:
+        metric_func = "AVG" if wants_average else "SUM"
+        metric_expr = f'{metric_func}(CAST("{metric_column}" AS REAL))'
+        metric_alias = _metric_alias(metric_column, "avg" if wants_average else "total")
 
     if target_dimension == "name" and "product" not in query and "item" not in query and "name" not in query:
         return None
@@ -207,8 +610,8 @@ def _build_heuristic_sql(user_msg: str, frame: pd.DataFrame) -> Optional[str]:
 
     if target_dimension:
         select_parts = [f'"{target_dimension}"', f'{metric_expr} AS "{metric_alias}"']
-        if wants_analysis and "price" in frame.columns:
-            select_parts.append('AVG(CAST("price" AS REAL)) AS "avg_price"')
+        if wants_analysis and metric_column:
+            select_parts.append(f'AVG(CAST("{metric_column}" AS REAL)) AS "{_metric_alias(metric_column, "avg")}"')
         sql_parts.insert(0, "SELECT " + ", ".join(select_parts))
         sql_parts.append(f'GROUP BY "{target_dimension}"')
         sql_parts.append(f'ORDER BY "{metric_alias}" {sort_direction}')
@@ -217,10 +620,10 @@ def _build_heuristic_sql(user_msg: str, frame: pd.DataFrame) -> Optional[str]:
         return "\n".join(sql_parts)
 
     aggregate_parts = ['COUNT(*) AS "record_count"']
-    if "price" in frame.columns:
+    if metric_column:
         aggregate_parts.extend([
-            'SUM(CAST("price" AS REAL)) AS "total_price"',
-            'AVG(CAST("price" AS REAL)) AS "avg_price"',
+            f'SUM(CAST("{metric_column}" AS REAL)) AS "{_metric_alias(metric_column, "total")}"',
+            f'AVG(CAST("{metric_column}" AS REAL)) AS "{_metric_alias(metric_column, "avg")}"',
         ])
     sql_parts.insert(0, "SELECT " + ", ".join(aggregate_parts))
     return "\n".join(sql_parts)
@@ -255,6 +658,14 @@ def _build_sql_generation_context(frame: pd.DataFrame) -> str:
         "numeric_summary": numeric_summary,
         "categorical_examples": categorical_examples,
     }
+    if SOURCE_FILE_COLUMN in frame.columns:
+        source_counts = frame[SOURCE_FILE_COLUMN].astype(str).value_counts().head(20)
+        context["multi_file_context"] = {
+            "source_column": SOURCE_FILE_COLUMN,
+            "source_files": source_counts.index.tolist(),
+            "rows_by_source_file": {str(key): int(value) for key, value in source_counts.items()},
+            "usage": "Use source_file to compare uploaded CSV/XLSX inputs.",
+        }
     return json.dumps(context, ensure_ascii=False, indent=2)
 
 
@@ -299,14 +710,14 @@ def _build_ranked_insight(user_msg: str, df: pd.DataFrame) -> Optional[str]:
 
     return "\n".join(
         [
-            "### Key Findings & Trends",
+            "### CSV Findings & Trends",
             f"- Ranked the top {len(top_rows)} {heading_label.lower()} entries using **{metric_label.lower()}**.",
             f"- The current leader is **{leader[label_col]}** with **{leader[value_col]:,.0f}**.",
             "",
-            "### Peaks & Lows / Top Performers",
+            "### CSV Peaks, Lows & Outliers",
             *[f"- {line}" for line in ranked_lines],
             "",
-            "### Business Interpretation",
+            "### CSV Business Interpretation",
             f"- The gap between the highest and lowest entry in this ranked view is **{spread:,.0f}** {metric_label.lower()}.",
             f"- Use this ranking to focus inventory, promotions, or partnership review around the strongest **{heading_label.lower()}** performers first.",
         ]
@@ -655,25 +1066,78 @@ RESULTS_CACHE: Dict[str, pd.DataFrame] = {}
 GRAPH_CACHE: Dict[str, Any] = {}
 
 # ---------------------------
-# Load CSV into SQLite (cached)
+# Load datasets into DuckDB (cached)
 # ---------------------------
 @st.cache_data
 def load_data():
-    return pd.read_csv("Superstore.csv", encoding="latin1")
+    manifest_data = _load_combined_dataset_from_manifest()
+    if manifest_data is not None:
+        return manifest_data
+    if DATA_PATH.exists():
+        return pd.read_csv(DATA_PATH, encoding="latin1")
+    raise FileNotFoundError(
+        "No dataset found. Upload a CSV/Excel file first so dataset_input/manifest.json can be built."
+    )
 
 @st.cache_resource
 def init_db(data: pd.DataFrame):
-    conn = sqlite3.connect("sales_temp.db", check_same_thread=False)
-    data.to_sql("sales", conn, if_exists="replace", index=False)
-    return conn
+    connection = duckdb.connect(database=":memory:")
+
+    table_context: Dict[str, Any] = {
+        "dialect": "DuckDB SQL",
+        "combined_table": "sales",
+        "tables": {},
+        "source_files": [],
+    }
+
+    connection.register("_combined_sales_df", data)
+    connection.execute("CREATE OR REPLACE TABLE sales AS SELECT * FROM _combined_sales_df")
+    connection.unregister("_combined_sales_df")
+    table_context["tables"]["sales"] = {
+        "description": "Combined bridge table across uploaded datasets. Use this for union-style cross-file comparisons.",
+        **_sample_table_context(data),
+    }
+
+    manifest = _read_dataset_manifest()
+    for index, item in enumerate(manifest.get("files", [])):
+        file_name = item.get("name") or f"dataset_{index + 1}"
+        file_path = item.get("path")
+        if not file_path or not Path(file_path).exists():
+            continue
+
+        table_name = _safe_table_name(file_name, index)
+        try:
+            frame = _read_table_file(file_path)
+        except Exception:
+            continue
+
+        connection.register(f"_dataset_df_{index}", frame)
+        connection.execute(
+            f"CREATE OR REPLACE TABLE {_duckdb_identifier(table_name)} AS SELECT * FROM {_duckdb_identifier(f'_dataset_df_{index}')}"
+        )
+        connection.unregister(f"_dataset_df_{index}")
+        table_context["tables"][table_name] = {
+            "description": f"Original uploaded dataset file: {file_name}",
+            "file_name": file_name,
+            **_sample_table_context(frame),
+        }
+        table_context["source_files"].append({
+            "file_name": file_name,
+            "table_name": table_name,
+            "rows": int(len(frame)),
+            "columns": int(len(frame.columns)),
+        })
+
+    return connection, table_context
 
 data = None
 conn = None
+query_context: Dict[str, Any] = {}
 
 def initialize_chatbot():
-    global data, conn
+    global data, conn, query_context
     data = load_data()
-    conn = init_db(data)
+    conn, query_context = init_db(data)
 
     return data, conn
 
@@ -719,14 +1183,16 @@ User query: "{user_msg}"
 """
     reply = _gemini_invoke(prompt)
     intent = reply.strip().upper() or "INSIGHT"
-    if intent not in ("SQL", "INSIGHT"):
+    if _should_force_sql_intent(user_msg):
+        intent = "SQL"
+    elif intent not in ("SQL", "INSIGHT"):
         intent = "INSIGHT"
     return {**state, "intent": intent}
 
 # ---------------------------
 # Node 2 â€” SQL Generator
 # ---------------------------
-def sql_node(state: State):
+def _legacy_sqlite_sql_node_disabled(state: State):
     if state.get("intent") != "SQL":
         return state
 
@@ -765,28 +1231,32 @@ def sql_node(state: State):
         return state
 
     user_msg = state["messages"][-1]["content"]
-    columns = ", ".join([f'"{c}"' for c in data.columns])
-    dataset_context = _build_sql_generation_context(data)
+    specialized_sql = _build_specialized_duckdb_sql(user_msg)
+    if specialized_sql:
+        return {**state, "sql_query": specialized_sql}
+
+    dataset_context = json.dumps(query_context or {}, ensure_ascii=False, indent=2)
 
     prompt = f"""
-You are an expert SQLite query generator.
-Return ONLY a single valid SQLite SELECT query (no explanations).
-TABLE: sales
-COLUMNS: {columns}
+You are an expert DuckDB SQL query generator.
+Return ONLY a single valid DuckDB SELECT query (no explanations).
 
 IMPORTANT RULES:
-- Always quote column names with double quotes.
+- Use only SELECT or WITH queries.
+- Always quote table names and column names with double quotes.
 - Always quote string filter values.
 - For top/bottom grouped requests, aggregate by the requested dimension.
 - If the user asks for top/bottom items without a metric, default to COUNT(*).
-- Use the dataset profile below to infer which columns contain brands, sources, categories, prices, availability, cities, and similar filters.
+- Use the DuckDB schema map below to choose the right table.
+- Prefer the separate per-file tables for file-specific questions or joins between uploaded CSV files.
+- Use "sales" only as a combined bridge table for union-style comparisons across uploaded files.
+- If the user asks about multiple CSVs, uploaded files, sources, or comparing inputs and no join key is needed, group by "source_file" from "sales".
+- "source_file" means the uploaded dataset filename, not a business source/channel unless the user clearly asks for a business source column.
+- If joining per-file tables, infer likely join keys from matching column names. Use explicit JOIN conditions.
 - Do not treat filler words like "the", "what", or "top" as literal filter values unless they clearly appear as business values in the sample/profile.
-- Use only SQLite syntax.
+- Use DuckDB syntax. For dates, prefer TRY_STRPTIME or CAST only when needed.
 
-DATE FORMAT ("Order Date" dd/mm/yyyy → YYYY-MM-DD):
-Use: SUBSTR("Order Date",7,4)||'-'||SUBSTR("Order Date",4,2)||'-'||SUBSTR("Order Date",1,2)
-
-Dataset profile (schema, first 5 rows, numeric summary, categorical examples):
+DuckDB schema map:
 {dataset_context}
 
 User query:
@@ -794,16 +1264,8 @@ User query:
 """
     reply = _gemini_invoke(prompt)
 
-    sql = reply.strip()
-    if sql.startswith("```"):
-        sql = sql.strip("`").strip()
-        if sql.lower().startswith("sql"):
-            sql = sql[3:].strip()
-
-    low = sql.lower()
-    if "select" in low:
-        sql = sql[low.index("select") :].strip()
-    if sql.lower().startswith("select") and not _looks_suspicious_sql(sql):
+    sql = _strip_sql_fences(reply)
+    if _is_safe_select_sql(sql) and not _looks_suspicious_sql(sql):
         return {**state, "sql_query": sql}
 
     heuristic_sql = _build_heuristic_sql(user_msg, data)
@@ -818,7 +1280,10 @@ def sql_exec_node(state: State):
         return state
 
     try:
-        df = pd.read_sql_query(sql, conn)
+        sql = _strip_sql_fences(sql)
+        if not _is_safe_select_sql(sql):
+            raise ValueError("Only SELECT/WITH DuckDB queries are allowed.")
+        df = conn.execute(sql).fetchdf()
         results_id = str(uuid.uuid4())
         RESULTS_CACHE[results_id] = df
         preview = df.head(100).to_dict(orient="records")
@@ -913,10 +1378,70 @@ def generate_graph_node(state: State):
     x_col = cfg.get("x_axis_column")
     y_col = cfg.get("y_axis_column")
     title_suffix = cfg.get("title_suffix") or "Data Visualization"
+    user_msg = state["messages"][-1]["content"]
+    query = _normalize_text_token(user_msg)
 
     fig = None
     try:
-        if chart_type == "pie":
+        numeric_cols = list(df.select_dtypes(include="number").columns)
+        if (
+            "branch" in df.columns
+            and {"avg_achievement_pct", "anomaly_count"}.issubset(df.columns)
+            and any(token in query for token in ["anomaly", "anomalies", "bottom", "performance", "recovery"])
+        ):
+            plot_df = df.copy()
+            if "overlap_status" not in plot_df.columns:
+                plot_df["overlap_status"] = "Branch risk profile"
+            size_col = "collection_case_count" if "collection_case_count" in plot_df.columns else None
+            fig = px.scatter(
+                plot_df,
+                x="avg_achievement_pct",
+                y="anomaly_count",
+                color="overlap_status",
+                size=size_col,
+                text="branch",
+                title="Branch Performance vs Recovery Anomaly Count",
+                labels={
+                    "avg_achievement_pct": "Avg achievement %",
+                    "anomaly_count": "Recovery anomaly count",
+                    "overlap_status": "Risk segment",
+                    "collection_case_count": "Collection cases",
+                },
+            )
+            fig.update_traces(textposition="top center")
+        elif (
+            "branch" in df.columns
+            and {"avg_achievement_pct", "avg_recovery_rate_pct"}.issubset(df.columns)
+            and any(token in query for token in ["both", "performance", "recovery", "single chart", "compare"])
+        ):
+            id_columns = ["branch"]
+            if "branch_group" in df.columns:
+                id_columns.append("branch_group")
+            metric_columns = ["avg_achievement_pct", "avg_recovery_rate_pct"]
+            long_df = df[id_columns + metric_columns].melt(
+                id_vars=id_columns,
+                value_vars=metric_columns,
+                var_name="metric",
+                value_name="value",
+            )
+            long_df["metric"] = long_df["metric"].replace({
+                "avg_achievement_pct": "Avg achievement %",
+                "avg_recovery_rate_pct": "Avg recovery rate %",
+            })
+            long_df["branch_label"] = long_df["branch"]
+            if "branch_group" in long_df.columns:
+                long_df["branch_label"] = long_df["branch_group"].astype(str) + " - " + long_df["branch"].astype(str)
+            fig = px.bar(
+                long_df,
+                x="branch_label",
+                y="value",
+                color="metric",
+                barmode="group",
+                title="Top and Bottom Branches: Performance vs Recovery",
+                labels={"branch_label": "Branch", "value": "Percent", "metric": "Metric"},
+            )
+            fig.update_layout(xaxis={'categoryorder': 'array', 'categoryarray': long_df["branch_label"].drop_duplicates().tolist()})
+        elif chart_type == "pie":
             if y_col is None:
                 series = df[x_col].value_counts().reset_index()
                 series.columns = [x_col, "value"]
@@ -985,7 +1510,9 @@ def insight_node(state: State):
         err_msg = df.iloc[0]["error"] if "error" in df.columns else "No results to analyze."
         return {**state, "insight": f"Could not analyze data. {err_msg}"}
 
-    ranked_insight = _build_ranked_insight(user_msg, df)
+    query = _normalize_text_token(user_msg)
+    wants_risk_or_recommendation = any(token in query for token in ["risk", "risks", "recommendation", "recommendations"])
+    ranked_insight = None if wants_risk_or_recommendation or "branch_group" in df.columns else _build_ranked_insight(user_msg, df)
     if ranked_insight:
         return {**state, "insight": ranked_insight}
 
@@ -1001,10 +1528,11 @@ You are an expert data analyst. Based on the **USER QUERY** and the **SQL RESULT
 **SQL RESULTS (Top 10 rows):**
 {preview_text}
 
-You MUST structure your response using the following Markdown headings:
-1.  **### Key Findings & Trends** (What are the most important conclusions?)
-2.  **### Peaks & Lows / Top Performers** (Identify the highest and lowest values or key categorical leaders.)
-3.  **### Business Interpretation** (Provide possible reasons and business implications for the findings.)
+You MUST structure your response using these CSV/dataframe-chat headings:
+1.  **### CSV Findings & Trends** (What are the most important conclusions from the queried CSV rows?)
+2.  **### CSV Peaks, Lows & Outliers** (Identify the highest values, lowest values, or notable row-level anomalies.)
+3.  **### CSV Data Risks** (Explain data quality, operational, or business risks visible in the result.)
+4.  **### CSV Action Recommendations** (Give practical actions tied directly to the CSV metrics.)
 
 Return ONLY the structured text using these headings. Do not include any introductory or concluding remarks outside of the structured sections.
 """
@@ -1098,7 +1626,7 @@ def render_chatbot_ui():
   <h3>Ask the dataset directly</h3>
   <p>Run SQL-backed questions, review concise analyst answers, and inspect supporting charts without leaving this workspace.</p>
   <div class="dataset-chat-metrics">
-    <span class="dataset-metric-chip">Live SQL answers</span>
+    <span class="dataset-metric-chip">DuckDB multi-table answers</span>
     <span class="dataset-metric-chip">Charts when useful</span>
     <span class="dataset-metric-chip">Conversation memory</span>
   </div>
@@ -1129,10 +1657,10 @@ def render_chatbot_ui():
 
     st.markdown('<div class="dataset-quick-prompt-label">Quick starts</div>', unsafe_allow_html=True)
     prompt_options = [
+        "Compare uploaded files by record count",
         "Top 10 products by sales",
         "Monthly sales trend",
         "Compare profit by region",
-        "Which segment is underperforming?",
     ]
     quick_prompt = None
     prompt_columns = st.columns(len(prompt_options))
@@ -1144,10 +1672,11 @@ def render_chatbot_ui():
     st.markdown('<div class="dataset-chat-input-row">', unsafe_allow_html=True)
     col1, col2 = st.columns([10, 2])
     with col1:
-        user_input = st.text_input(
+        user_input = st.text_area(
             "Type your question...",
             key="user_input_box",
             label_visibility="collapsed",
+            height=110,
             placeholder="Ask about trends, anomalies, top categories, totals, comparisons, or request a chart...",
         )
     with col2:

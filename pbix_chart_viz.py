@@ -27,7 +27,7 @@ def _as_floats(values: Iterable) -> list[float]:
         try:
             converted.append(float(value))
         except Exception:
-            continue
+            converted.append(None)
     return converted
 
 
@@ -76,22 +76,54 @@ def build_pbix_figure(chart: dict) -> go.Figure | None:
     if not chart or not chart.get("data_available", True):
         return None
 
+    chart_type = str(chart.get("chart_type", "")).lower()
+    title = chart.get("title", "Chart")
+    measure_label = chart.get("measure_used", "Value")
+
+    if "card" in chart_type and chart.get("card_value") is not None:
+        value = chart.get("card_value")
+        prefix = chart.get("card_prefix", "")
+        suffix = chart.get("card_suffix", "")
+        number = value if isinstance(value, (int, float)) else 0
+        fig = go.Figure(
+            go.Indicator(
+                mode="number",
+                value=number,
+                number={"prefix": prefix, "suffix": suffix},
+                title={"text": title},
+            )
+        )
+        fig.update_layout(
+            template="plotly_white",
+            height=280,
+            margin=dict(l=36, r=36, t=70, b=28),
+            paper_bgcolor="#ffffff",
+            font=dict(color="#1f3557"),
+        )
+        return fig
+
     raw_x_values = list(chart.get("x", []) or [])
     x_values = _as_strings(raw_x_values)
     if not x_values:
-        return None
+        has_scatter_series = any(
+            series_item.get("x") and series_item.get("y")
+            for series_item in chart.get("series", [])
+        )
+        if not has_scatter_series:
+            return None
 
-    chart_type = str(chart.get("chart_type", "")).lower()
-    measure_label = chart.get("measure_used", "Value")
-    title = chart.get("title", "Chart")
     display_title = title
 
     if chart.get("series"):
         series_payload = [
-            {"name": series_item.get("name", "Series"), "y": list(series_item.get("y", []))}
+            {
+                "name": series_item.get("name", "Series"),
+                "x": list(series_item.get("x", [])),
+                "y": list(series_item.get("y", [])),
+            }
             for series_item in chart.get("series", [])
         ]
-        if len(x_values) > 14 and any(
+        if x_values and len(x_values) > 14 and any(
             token in chart_type for token in ("bar", "column", "stacked", "clustered", "pie", "donut")
         ):
             x_values, series_payload = _trim_multi_series(x_values, series_payload, limit=12)
@@ -191,10 +223,12 @@ def build_pbix_figure(chart: dict) -> go.Figure | None:
                     )
                 )
             elif "scatter" in chart_type:
+                scatter_x = _as_floats(series_item.get("x", []))
+                scatter_y = _as_floats(y_values)
                 fig.add_trace(
                     go.Scatter(
-                        x=x_values,
-                        y=y_values,
+                        x=scatter_x if scatter_x and len(scatter_x) == len(scatter_y) else x_values,
+                        y=scatter_y if scatter_y else y_values,
                         mode="markers",
                         name=name,
                     )

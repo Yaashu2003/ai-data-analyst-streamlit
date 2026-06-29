@@ -8,9 +8,17 @@ __pycache__/
 *.db
 *.csv
 *.pbix
+*.twb
+*.twbx
+*.hyper
+*.tde
+*.tds
 charts/
 charts_html/
 uploads/
+fastapi_runtime/
+sample_bi_downloads/
+hyperd.log
 .pytest_cache/
 analysis_report.txt
 analysis_results.json
@@ -24,8 +32,6 @@ report_input_compare_gate/
 report_input_single_check/
 report_input_single_check_auto/
 reort_ai/
-reort_ai/report_input/
-reort_ai/vector_store/
 chart_snapshots/
 scratch/
 scratch_*.py
@@ -40,3 +46,15 @@ node_modules/
 dist/
 build/
 app.yaml
+
+# Visual and extracted packs & temp files
+bfsi_openable_bi_pack/
+bfsi_cross_analytics_pack/
+dataset_input/
+autoviz/
+*.xlsx
+*.xlsx.xlsx
+*.xlsx.xlsx.xlsx
+*.ipynb
+*.html
+*.txt

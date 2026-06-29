@@ -74,6 +74,11 @@ AGGREGATION_PREFIXES = (
     "DistinctCount",
 )
 
+DATE_HIERARCHY_PATTERN = re.compile(
+    r"^(?P<base>.+?)(?:\.Variation)?\.Date Hierarchy\.(?P<level>Year|Quarter|Month|Day)$",
+    re.IGNORECASE,
+)
+
 
 def parse_query_ref(query_ref):
 
@@ -127,6 +132,28 @@ def field_name_only(field):
         return text.split(".", 1)[1]
 
     return text
+
+
+def hierarchy_granularity(field):
+
+    text = field_name_only(field)
+    match = DATE_HIERARCHY_PATTERN.match(text)
+    if not match:
+        return None
+
+    return match.group("level").lower()
+
+
+def hierarchy_rank(field):
+
+    granularity = hierarchy_granularity(field)
+    ranks = {
+        "year": 1,
+        "quarter": 2,
+        "month": 3,
+        "day": 4,
+    }
+    return ranks.get(granularity, 0)
 
 
 def collect_roles_from_config(single_visual):
@@ -451,12 +478,290 @@ def resolve_table_field(field, tables):
     return None
 
 
+def resolve_dataframe_column(df, field_name):
+
+    candidate = str(field_name)
+    if candidate in df.columns:
+        return candidate, None
+
+    match = DATE_HIERARCHY_PATTERN.match(candidate)
+    if match:
+        base = match.group("base").strip()
+        if base in df.columns:
+            return base, match.group("level").lower()
+
+    normalized_columns = {
+        re.sub(r"[^a-z0-9]+", "", str(column).lower()): column
+        for column in df.columns
+    }
+
+    direct_key = re.sub(r"[^a-z0-9]+", "", candidate.lower())
+    if direct_key in normalized_columns:
+        return normalized_columns[direct_key], None
+
+    if match:
+        base_key = re.sub(r"[^a-z0-9]+", "", match.group("base").lower())
+        if base_key in normalized_columns:
+            return normalized_columns[base_key], match.group("level").lower()
+
+    return None, None
+
+
 def coerce_numeric_series(series):
 
     numeric = pd.to_numeric(series, errors="coerce")
     if numeric.notna().sum() == 0:
-        return None
+        text_series = series.astype(str).str.strip()
+        cleaned = (
+            text_series
+            .str.replace(",", "", regex=False)
+            .str.replace("%", "", regex=False)
+            .str.replace("₹", "", regex=False)
+            .str.replace("$", "", regex=False)
+            .str.replace("(", "-", regex=False)
+            .str.replace(")", "", regex=False)
+        )
+        numeric = pd.to_numeric(cleaned, errors="coerce")
+        if numeric.notna().sum() == 0:
+            return None
     return numeric
+
+
+def prepare_category_column(df, column_name, granularity=None):
+
+    if not granularity:
+        return df, column_name
+
+    if column_name not in df.columns:
+        return df, column_name
+
+    datetime_series = pd.to_datetime(df[column_name], errors="coerce")
+    if datetime_series.notna().sum() == 0:
+        return df, column_name
+
+    working = df.copy()
+    derived_col = "__category_group__"
+
+    if granularity == "year":
+        working[derived_col] = datetime_series.dt.year.astype("Int64").astype(str)
+    elif granularity == "quarter":
+        working[derived_col] = (
+            datetime_series.dt.year.astype("Int64").astype(str)
+            + " Q"
+            + datetime_series.dt.quarter.astype("Int64").astype(str)
+        )
+    elif granularity == "month":
+        working[derived_col] = datetime_series.dt.to_period("M").astype(str)
+    elif granularity == "day":
+        working[derived_col] = datetime_series.dt.date.astype(str)
+    else:
+        return df, column_name
+
+    return working, derived_col
+
+
+def choose_category_field(category_fields, tables):
+
+    if not category_fields:
+        return None
+
+    ranked_fields = sorted(category_fields, key=hierarchy_rank, reverse=True)
+
+    for field in ranked_fields:
+        resolved = resolve_table_field(field, tables)
+        if resolved:
+            return resolved, hierarchy_granularity(field)
+
+    return None
+
+
+def aggregate_card_value(df, measure_strategy):
+
+    agg = measure_strategy.get("aggregation", "count")
+    field = measure_strategy.get("field")
+
+    if agg == "count":
+        if field and field in df.columns:
+            return float(df[field].count())
+        return float(len(df))
+
+    if agg == "nunique":
+        if not field or field not in df.columns:
+            return None
+        return float(df[field].nunique())
+
+    if not field or field not in df.columns:
+        return None
+
+    numeric_series = measure_strategy.get("numeric_series")
+    if numeric_series is None:
+        numeric_series = coerce_numeric_series(df[field])
+    if numeric_series is None:
+        return None
+
+    series = numeric_series.dropna()
+    if series.empty:
+        return None
+
+    if agg == "sum":
+        return float(series.sum())
+    if agg == "mean":
+        return float(series.mean())
+    if agg == "min":
+        return float(series.min())
+    if agg == "max":
+        return float(series.max())
+
+    return None
+
+
+def build_card_chart_data(tables, visual, report_name):
+
+    roles = visual.get("roles", {})
+    query_refs = visual.get("query_refs", {})
+    data_fields = roles.get("Data", [])
+
+    if not data_fields:
+        return []
+
+    resolved_data = resolve_table_field(data_fields[0], tables)
+    if not resolved_data:
+        return []
+
+    source_table, raw_col = resolved_data
+    if source_table not in tables:
+        return []
+
+    df = tables[source_table].copy()
+    df = df.loc[:, ~df.columns.duplicated()]
+    resolved_col, _ = resolve_dataframe_column(df, raw_col)
+    if not resolved_col:
+        return []
+
+    measure_strategy = determine_measure_strategy(
+        df,
+        [(source_table, resolved_col)],
+        {"Values": query_refs.get("Data", [])},
+    )
+    if not measure_strategy:
+        query_ref = first_query_ref(query_refs, ["Data"])
+        agg = parse_aggregation_name(query_ref)
+        if agg == "count":
+            measure_strategy = {
+                "field": resolved_col,
+                "aggregation": "count",
+                "label": "record_count",
+            }
+        elif agg == "nunique":
+            measure_strategy = {
+                "field": resolved_col,
+                "aggregation": "nunique",
+                "label": f"{resolved_col}_distinct_count",
+            }
+        else:
+            numeric_series = coerce_numeric_series(df[resolved_col])
+            if numeric_series is None:
+                return []
+            measure_strategy = {
+                "field": resolved_col,
+                "aggregation": agg or "sum",
+                "label": resolved_col,
+                "numeric_series": numeric_series,
+            }
+
+    metric_value = aggregate_card_value(df, measure_strategy)
+    if metric_value is None:
+        return []
+
+    return [{
+        "report": report_name,
+        "chart_type": visual["visual_type"],
+        "page": visual["page_name"],
+        "title": visual["title"],
+        "dimension": resolved_col,
+        "source_table": source_table,
+        "x": [visual.get("title") or resolved_col],
+        "y": [metric_value],
+        "measure_used": measure_strategy.get("label"),
+        "card_value": metric_value,
+    }]
+
+
+def build_scatter_chart_data(tables, visual, report_name):
+
+    roles = visual.get("roles", {})
+    x_fields = roles.get("X", [])
+    y_fields = roles.get("Y", []) or roles.get("Values", [])
+    series_fields = roles.get("Series", []) or roles.get("Legend", [])
+
+    if not x_fields or not y_fields:
+        return []
+
+    resolved_x = resolve_table_field(x_fields[0], tables)
+    resolved_y = resolve_table_field(y_fields[0], tables)
+
+    if not resolved_x or not resolved_y:
+        return []
+
+    x_table, raw_x_col = resolved_x
+    y_table, raw_y_col = resolved_y
+    if x_table != y_table or x_table not in tables:
+        return []
+
+    df = tables[x_table].copy()
+    df = df.loc[:, ~df.columns.duplicated()]
+
+    x_col, _ = resolve_dataframe_column(df, raw_x_col)
+    y_col, _ = resolve_dataframe_column(df, raw_y_col)
+    if not x_col or not y_col:
+        return []
+
+    x_numeric = coerce_numeric_series(df[x_col])
+    y_numeric = coerce_numeric_series(df[y_col])
+    if x_numeric is None or y_numeric is None:
+        return []
+
+    working = df.copy()
+    working["__scatter_x__"] = x_numeric
+    working["__scatter_y__"] = y_numeric
+    working = working.dropna(subset=["__scatter_x__", "__scatter_y__"])
+    if working.empty:
+        return []
+
+    chart = {
+        "report": report_name,
+        "chart_type": visual["visual_type"],
+        "page": visual["page_name"],
+        "title": visual["title"],
+        "dimension": x_col,
+        "source_table": x_table,
+        "measure_used": y_col,
+    }
+
+    if series_fields:
+        resolved_series = resolve_table_field(series_fields[0], tables)
+        if resolved_series:
+            _, raw_series_col = resolved_series
+            series_col, _ = resolve_dataframe_column(working, raw_series_col)
+        else:
+            series_col = None
+
+        if series_col and series_col in working.columns:
+            series_payload = []
+            for series_name, subset in working.groupby(series_col):
+                series_payload.append({
+                    "name": str(series_name),
+                    "x": subset["__scatter_x__"].astype(float).tolist(),
+                    "y": subset["__scatter_y__"].astype(float).tolist(),
+                })
+            if series_payload:
+                chart["series"] = series_payload
+                chart["x"] = []
+                return [chart]
+
+    chart["x"] = working["__scatter_x__"].astype(float).tolist()
+    chart["y"] = working["__scatter_y__"].astype(float).tolist()
+    return [chart]
 
 
 def determine_measure_strategy(df, value_fields, query_refs_map):
@@ -576,9 +881,11 @@ def build_chart_data(tables, visual, report_name):
 
     roles = visual.get("roles", {})
     query_refs = visual.get("query_refs", {})
+    visual_type = str(visual.get("visual_type", "")).lower()
 
     category_fields = (
         roles.get("Category", [])
+        or roles.get("Axis", [])
         or roles.get("X", [])
         or roles.get("Rows", [])
         or roles.get("Group", [])
@@ -589,6 +896,7 @@ def build_chart_data(tables, visual, report_name):
         or roles.get("Y", [])
         or roles.get("Measure", [])
         or roles.get("Columns", [])
+        or roles.get("Value", [])
     )
 
     series_fields = (
@@ -596,14 +904,21 @@ def build_chart_data(tables, visual, report_name):
         or roles.get("Legend", [])
     )
 
+    if "card" in visual_type:
+        return build_card_chart_data(tables, visual, report_name)
+
+    if "scatter" in visual_type:
+        return build_scatter_chart_data(tables, visual, report_name)
+
     if not category_fields:
         return charts
 
-    resolved_category = resolve_table_field(category_fields[0], tables)
-    if not resolved_category:
+    chosen_category = choose_category_field(category_fields, tables)
+    if not chosen_category:
         return charts
 
-    x_table, x_col = resolved_category
+    resolved_category, category_granularity = chosen_category
+    x_table, raw_x_col = resolved_category
 
     if x_table not in tables:
         return charts
@@ -612,8 +927,13 @@ def build_chart_data(tables, visual, report_name):
 
     df = df.loc[:, ~df.columns.duplicated()]
 
-    if x_col not in df.columns:
+    x_col, category_granularity = resolve_dataframe_column(df, raw_x_col)
+    if not x_col or x_col not in df.columns:
         return charts
+
+    df, prepared_x_col = prepare_category_column(df, x_col, category_granularity)
+    if prepared_x_col:
+        x_col = prepared_x_col
 
     df = ensure_series(df, x_col)
 
@@ -622,8 +942,13 @@ def build_chart_data(tables, visual, report_name):
         return charts
 
     y_col = measure_strategy.get("field")
-    if y_col and y_col in df.columns:
-        df = ensure_series(df, y_col)
+    if y_col:
+        resolved_y_col, _ = resolve_dataframe_column(df, y_col)
+        if resolved_y_col and resolved_y_col in df.columns:
+            measure_strategy = dict(measure_strategy)
+            measure_strategy["field"] = resolved_y_col
+            y_col = resolved_y_col
+            df = ensure_series(df, y_col)
 
     try:
 
@@ -632,9 +957,10 @@ def build_chart_data(tables, visual, report_name):
 
             resolved_series = resolve_table_field(series_fields[0], {x_table: df})
             if resolved_series:
-                _, s_col = resolved_series
+                _, raw_s_col = resolved_series
+                s_col, _ = resolve_dataframe_column(df, raw_s_col)
             else:
-                s_col = field_name_only(series_fields[0])
+                s_col, _ = resolve_dataframe_column(df, field_name_only(series_fields[0]))
 
             if s_col in df.columns:
 
@@ -718,6 +1044,7 @@ def build_visual_descriptor(tables, visual, report_name):
 
     category_fields = (
         roles.get("Category", [])
+        or roles.get("Axis", [])
         or roles.get("X", [])
         or roles.get("Rows", [])
         or roles.get("Group", [])
@@ -727,6 +1054,7 @@ def build_visual_descriptor(tables, visual, report_name):
         or roles.get("Y", [])
         or roles.get("Measure", [])
         or roles.get("Columns", [])
+        or roles.get("Value", [])
     )
 
     dimension = field_name_only(category_fields[0]) if category_fields else None

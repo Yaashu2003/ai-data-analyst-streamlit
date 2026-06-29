@@ -21,6 +21,7 @@ from chart_assets import collect_canonical_chart_assets
 # Suppress warnings that might clutter the output
 warnings.filterwarnings('ignore', category=UserWarning)
 
+
 def setup_gemini(api_key=None):
     """Setup Google Gemini vision model"""
     print(" Checking if Gemini is available...")
@@ -33,8 +34,8 @@ def setup_gemini(api_key=None):
         # Client initializes using explicitly provided key
         client = genai.Client(api_key=api_key)
         print(" Gemini client initialized successfully!")
-        # IMPORTANT: Use gemini-2.5-flash as default, fall back to 1.5 if needed
-        return client, "gemini-2.5-flash" 
+        # IMPORTANT: Use gemini-3.1-flash-lite as default, fall back to 1.5 if needed
+        return client, "gemini-3.1-flash-lite" 
     except Exception as e:
         print(f" Error initializing Gemini: {e}")
         print("Ensure your GEMINI_API_KEY is set correctly.")
@@ -152,10 +153,8 @@ class EnhancedInsightGenerator:
                 "source": asset.get("source", "unknown"),
                 "metadata": metadata,
             })
-            if len(selected_entries) >= 10:
-                break
 
-        print(f" Selected {len(selected_entries)} chart assets for VLM.")
+        print(f" Selected {len(selected_entries)} chart assets for VLM review.")
         print(f" Skipped {snapshot_failures} assets because no usable PNG or HTML snapshot was available.")
         return selected_entries
 
@@ -182,13 +181,18 @@ class EnhancedInsightGenerator:
             # 2. Analyze charts holistically with Gemini Vision (VLM)
             if self.vlm_available:
                 all_charts_to_analyze = self._prepare_chart_assets_for_vlm(state)
-                
+                # Detect multi-dataset mode from the state
+                source_files = state.get("dataset_info", {}).get("source_files", [])
+                is_multi = len(source_files) > 1
+
                 if all_charts_to_analyze:
-                    print(f"Running Holistic VLM Analysis on {len(all_charts_to_analyze)} charts...")
-                    
+                    print(f"Running Holistic VLM Analysis on {len(all_charts_to_analyze)} charts (multi_dataset={is_multi})...")
+
                     # Call the Gemini analysis, which now returns a single string
-                    visual_insights_content = self._analyze_charts_holistically_with_gemini(state, all_charts_to_analyze) 
-                    
+                    visual_insights_content = self._analyze_charts_holistically_with_gemini(
+                        state, all_charts_to_analyze, multi_dataset_mode=is_multi
+                    )
+
                     #  NEW: Label and append the single Gemini insight string
                     if visual_insights_content and isinstance(visual_insights_content, str):
                         # Prepend the GEMINI label for the final report
@@ -202,7 +206,7 @@ class EnhancedInsightGenerator:
         return insights
     
     
-    def _analyze_charts_holistically_with_gemini(self, state: 'IntelligentAnalysisState', chart_entries: List[Dict[str, Any]]) -> str:
+    def _analyze_charts_holistically_with_gemini(self, state: 'IntelligentAnalysisState', chart_entries: List[Dict[str, Any]], multi_dataset_mode: bool = False) -> str:
         """
         Use Google Gemini to analyze ALL charts simultaneously and generate a single, 
         comprehensive business intelligence report. Returns a single string report.
@@ -251,19 +255,44 @@ class EnhancedInsightGenerator:
         # --- 2. Construct the Comprehensive Prompt ---
         #  Ensure the list is correctly formatted for Gemini
         chart_list_for_prompt = "\n".join([f"- **{name}**" for name in chart_names])
-        chart_list_for_catalog = "\n".join([f"{i+1}. **{name}**: [Provide a 2-3 sentence strategic business insight. Do not describe colors or shapes. Focus on KPI meaning, risk, growth, anomaly, or action.]" for i, name in enumerate(chart_names)])
         chart_metadata_context = "\n".join(metadata_sections) if metadata_sections else "- No extra chart metadata extracted."
         
+        # Build the cross-dataset section only when multiple source files are present
+        source_files = state.get("dataset_info", {}).get("source_files", [])
+        multi_file_labels = ", ".join([f"`{f}`" for f in source_files]) if source_files else ""
+        cross_dataset_section = ""
+        if multi_dataset_mode and len(source_files) > 1:
+            cross_dataset_section = f"""
+#### 5. Cross-Dataset Comparison: {multi_file_labels}
+For EACH pair of source datasets, provide a dedicated sub-section comparing:
+* **Volume & Scale** — which dataset has higher row count, transaction frequency, or activity level, and by how much?
+* **Key Metric Divergence** — identify the single most important metric where the datasets differ significantly (e.g. NPA, revenue, churn rate, loan amount). Quantify the gap.
+* **Channel / Segment Patterns** — which channels, branches, or segments dominate in each dataset, and do they differ?
+* **Risk Profile** — which dataset carries higher credit, operational, or business risk, and why?
+* **Shared Trends** — identify at least one pattern or anomaly that appears consistently across both datasets.
+
+#### 6. Predictive Signals & Forward-Looking Insights
+Based on observed trends across ALL uploaded datasets, provide at least 6 forward-looking insights:
+* Each must be a distinct, quantified prediction or risk flag (e.g. "NPA is projected to rise 12% in Q4 if July loan volumes repeat").
+* Cover at minimum: revenue/volume trajectory, risk escalation likelihood, channel growth, and operational efficiency.
+* Flag any metrics showing early warning signals even if not yet at threshold.
+
+#### 7. High-Value Insight Ranking
+Rank the top 10 most business-critical findings from ALL sections above, ordered from most to least urgent. Format:
+1. [Finding] — [Why it matters] — [Recommended action]
+(Repeat for each of the 10 findings)
+"""
+
         holistic_prompt = f"""
 You are a **Senior Business Analyst and Strategy Consultant**. Your task is to analyze the 
 {len(content_parts)} provided charts holistically, treating them as a complete business intelligence dashboard 
 for the **{dataset_name}** ({dataset_shape[0]:,} records).
 
-You must provide an analysis that synthesizes information across all visuals and strictly adheres to the 
-REQUIRED OUTPUT FORMAT below.
+You must provide a comprehensive, deeply analytical report. Do NOT give a surface-level summary — 
+extract every meaningful signal, quantify everything possible, and generate as many high-value insights as the data supports.
 
 ###  Reference File List (CRITICAL: COPY THESE NAMES EXACTLY)
-This is the list of **{len(chart_names)}** chart filenames you must use for the **Chart Catalog (Section 0)**.
+This is the candidate list of **{len(chart_names)}** chart filenames. Use ALL of these charts as evidence while writing the analysis, predictions, risks, and recommendations.
 {chart_list_for_prompt}
 
 ### Supplemental Chart Metadata
@@ -273,37 +302,97 @@ Use this metadata to interpret HTML-backed fallback snapshots accurately wheneve
 ###  EXECUTIVE SUMMARY REPORT (REQUIRED OUTPUT FORMAT)
 
 #### 0. Chart Catalog
-**CRITICAL INSTRUCTION**: Generate a complete list of ALL {len(chart_names)} charts. Use this exact format for every item, and do not stop until the list is complete.
 
-{chart_list_for_catalog}
+**YOUR TASK**: Review every chart filename in the Reference File List above and the chart images provided.
+Score each chart using the criteria below, then select and list only the charts that genuinely earn their place in the report.
+**SCORING RULES - score each chart by general analytical value. These rules must work for ANY CSV domain: sales, finance, HR, marketing, product, operations, logistics, education, healthcare, banking, support, survey, IoT, or custom business data. Do not assume the dataset is mainly about risk unless the columns and charts clearly support that.**
+
+*Trend, Change & Time Dynamics:*
+- +3 pts: Chart shows a clear time trend, acceleration, slowdown, seasonality, cycle, or inflection.
+- +3 pts: Chart identifies a peak, trough, turning point, or period that needs attention.
+- +2 pts: Chart tracks an important metric over time, even when the domain is not sales or finance.
+
+*Magnitude, Ranking & Contribution:*
+- +3 pts: Chart identifies top or bottom contributors, highest-impact categories, largest sources, or dominant groups.
+- +3 pts: Chart shows a meaningful gap between leaders and laggards.
+- +2 pts: Chart explains composition, share, mix, Pareto concentration, or cumulative contribution.
+
+*Segmentation, Cohorts & Comparison:*
+- +3 pts: Chart breaks results across useful segments, cohorts, geographies, teams, products, customers, channels, statuses, or classes.
+- +3 pts: Chart compares multiple uploaded files/datasets and reveals a relationship, mismatch, overlap, or dependency between them.
+- +2 pts: Chart reveals behavior or outcome differences between groups.
+
+*Relationships, Drivers & Diagnostics:*
+- +3 pts: Chart shows a correlation, trade-off, driver relationship, dependency, or explanatory factor.
+- +3 pts: Chart helps explain why a metric changed or why one segment differs from another.
+- +2 pts: Chart connects input metrics to outcome metrics, such as cost to output, activity to result, usage to retention, or workload to performance.
+
+*Quality, Exceptions & Risk When Relevant:*
+- +3 pts: Chart reveals outliers, anomalies, missingness, data quality issues, spikes, unexpected drops, or inconsistent records.
+- +2 pts: Chart surfaces risk only when the data supports it, such as churn, default, delay, complaint, defect, attrition, stockout, SLA breach, loss, or compliance issue.
+- +2 pts: Chart identifies weak spots or underperforming segments that require follow-up.
+
+*Efficiency, Capacity & Process:*
+- +3 pts: Chart reveals productivity, utilization, throughput, cycle time, turnaround time, capacity, cost-per-unit, or process bottlenecks.
+- +2 pts: Chart compares actual vs target, planned vs actual, budget vs result, forecast vs actual, or SLA vs performance.
+
+*Opportunity, Forecast & Next Action:*
+- +3 pts: Chart reveals growth potential, optimization opportunity, underserved segment, demand signal, forecastable pattern, or action priority.
+- +2 pts: Chart supports a concrete recommendation, experiment, policy change, resource shift, or monitoring metric.
+
+*Deductions:*
+- -2 pts: Chart covers a topic already represented by a higher-scoring chart in your selection.
+- -2 pts: Chart contains mostly empty, null, or near-uniform data with no meaningful variation.
+- -3 pts: Chart is a generic distribution or count histogram with no business interpretation possible.
+- EXCLUDE any chart whose filename contains: kpi_distribution_violin, outlier_detection_box, data_quality_missing_values, distribution_with_marginals.
+
+**SELECTION RULES:**
+- Include a MINIMUM of 6 charts. There is NO maximum - include as many as are genuinely insightful.
+- Balance your selection across the analytical categories above. Do not over-index on risk/anomaly charts unless the dataset is clearly risk-oriented.
+- Include at least 1 TIME SERIES chart if one exists in the reference list.
+- Include at least 1 SEGMENT COMPARISON or CROSS-FILE chart if one exists.
+- No more than 2 charts may share the exact same chart topic.
+
+**OUTPUT FORMAT - copy filenames EXACTLY character-for-character as they appear in the Reference File List. No spelling changes, no path additions, no truncation:**
+1. **exact_filename_here.png**: [2-3 sentences. State the specific analytical or business insight this chart provides, using numbers where visible. Explain what decision, monitoring action, or next step this chart supports.]
+2. **exact_filename_here.png**: [Same format.]
+...continue for every chart you select. Do not add any commentary, headers, or text after the final entry.
 
 #### 1. Overall Performance Summary
-(Write one short paragraph, ideally 70-110 words, on business health, KPI direction, and operating posture.)
+(Write one paragraph of 100-150 words on business health, KPI direction, and operating posture. Include at least 3 quantified observations.)
 
 #### 2. Key Insights & Drivers
-Provide exactly 3 short bullets:
-* **[Performance Driver]:** Identify the biggest positive contributor and quantify it when possible.
-* **[Risk / Weakness]:** Identify the most important margin, demand, inventory, pricing, or operational risk.
-* **[Trend / Pattern or Anomaly]:** Describe the strongest structural pattern or the most important outlier.
+Provide at least 8 insight bullets - do NOT cap at 3. Cover all of the following where data supports it:
+* **[Primary Driver]:** Identify the biggest contributor to the main outcome metric and quantify it.
+* **[Trend / Pattern]:** The strongest structural trend across time, categories, or segments.
+* **[Segment Contrast]:** Which group leads, which group lags, and how large the gap is.
+* **[Relationship / Cause Signal]:** Which variables appear connected, correlated, or explanatory.
+* **[Exception / Anomaly]:** Any outlier, spike, missingness, drop, or unusual concentration that matters.
+* **[Efficiency / Productivity]:** Where output, utilization, speed, cost, or conversion is strongest or weakest.
+* **[Opportunity / Forecast Signal]:** Where the data points to growth, optimization, prevention, or next-best action.
+* **[Data Trust Note]:** Any data quality limitation that affects interpretation.
+* Add further bullets for any additional significant findings from the charts.
 
 #### 3. Risks / Issues
-Provide 2-3 concise bullets on the main commercial or analytical risks surfaced by the charts.
+Provide concise bullets on risks, issues, limitations, or watch-outs surfaced by the charts. Adapt this section to the dataset domain: these may be business risks, operational bottlenecks, data-quality problems, customer/process issues, performance gaps, compliance concerns, or analytical uncertainty. If the dataset does not show strong risk signals, say that clearly and focus on limitations or monitoring points instead.
 
 #### 4. Recommendations
-Provide exactly 3 concise, business-ready actions. Tie each action back to chart evidence.
-
-NOTE: Keep the report crisp and executive-friendly. Give chart insights from a business point of view, not a visual description. Do NOT say "this chart shows"; say what the chart means.
-
+Provide at least 6 concise, business-ready actions. Each must:
+- Be tied to specific chart evidence
+- Include a measurable target or success metric
+- Specify a timeframe (short-term <3 months, mid-term 3-12 months, long-term >12 months)
+{cross_dataset_section}
+NOTE: Give insights from a business point of view only. Do NOT describe chart colors or shapes. Do NOT say "this chart shows" — say what the data MEANS. Use numbers wherever visible or inferable.
 
         """
         # --- 3. Execute VLM Call ---
-        config = types.GenerateContentConfig(max_output_tokens=9000, temperature=0.35)
+        config = types.GenerateContentConfig(max_output_tokens=16000, temperature=0.35)
         content_parts_with_prompt = [holistic_prompt, *content_parts]
 
         try:
             response = generate_content_with_model_fallback(
                 client=self.gemini_client,
-                model="gemini-2.5-flash",
+                model="gemini-3.1-flash-lite",
                 contents=content_parts_with_prompt,
                 config=config,
                 api_key=self.api_key,
@@ -331,13 +420,19 @@ NOTE: Keep the report crisp and executive-friendly. Give chart insights from a b
             return "No specialized analysis results to analyze."
         
         specialized_prompt = f"""
-        Analyze these business analysis results and provide key insights:
+        Analyze these business analysis results and provide a comprehensive set of insights:
         
         {json.dumps(summarized_results, indent=2)}
         
         You are a **Senior Business Analyst and Strategy Consultant**.
         
-        Provide the analysis in a bulleted list, focusing on the most important, quantified findings.
+        Provide a DETAILED bulleted list with AT LEAST 10 quantified findings. For each insight:
+        - State the specific metric or pattern observed
+        - Quantify it (use numbers, percentages, or ratios wherever possible)
+        - State whether it is a risk, opportunity, anomaly, or trend
+        - Suggest the most important action or next step
+
+        After the main bullets, add a short section titled **Cross-File Patterns** if data from multiple source files is visible in the keys (look for '::' separators in the keys indicating per-file analyses). Compare the same metric across files and call out any divergence.
         """
         
         try:
@@ -346,7 +441,7 @@ NOTE: Keep the report crisp and executive-friendly. Give chart insights from a b
                 
             response = generate_content_with_model_fallback(
                 client=self.gemini_client,
-                model="gemini-2.5-flash",
+                model="gemini-3.1-flash-lite",
                 contents=[specialized_prompt],
                 config=types.GenerateContentConfig(temperature=0.1),
                 api_key=self.api_key,

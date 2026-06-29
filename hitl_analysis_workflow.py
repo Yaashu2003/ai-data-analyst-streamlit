@@ -1,4 +1,4 @@
-# hitl_analysis_workflow.py
+﻿# hitl_analysis_workflow.py
 # Human-In-The-Loop (HITL) Iterative Data Analysis Workflow
 
 from typing import TypedDict, List, Dict, Any, Optional, Literal
@@ -326,7 +326,7 @@ class HITLAnalysisWorkflow:
                 """
                 
                 response = client.models.generate_content(
-                    model="gemini-2.5-flash",
+                    model="gemini-3.1-flash-lite",
                     contents=[prompt]
                 )
                 
@@ -480,7 +480,7 @@ class HITLAnalysisWorkflow:
             """
             
             response = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-3.1-flash-lite",
                 contents=[insight_prompt]
             )
             
@@ -578,7 +578,7 @@ class HITLAnalysisWorkflow:
                     """
                     
                     response = client.models.generate_content(
-                        model="gemini-2.5-flash",
+                        model="gemini-3.1-flash-lite",
                         contents=[prompt]
                     )
                     

@@ -1,4 +1,4 @@
-import gemini_patch
+﻿import gemini_patch
 import os
 import json
 import re
@@ -12,6 +12,7 @@ import pandas as pd
 from unzipping import extract_all_reports
 from chart_pipeline import extract_visuals, build_chart_data, build_visual_descriptor
 from gemini_patch import generate_content_with_model_fallback
+import tableau_pipeline as _twb
 
 
 # ======================================================
@@ -877,6 +878,28 @@ def process_all_reports(report_folder, external_data_files=None):
 
     for report_name, layout_path in layout_map.items():
 
+        # --------------------------------------------------
+        # TABLEAU: TWB / TWBX
+        # --------------------------------------------------
+        if isinstance(layout_path, tuple) and layout_path[0] == "tableau":
+            twb_path = layout_path[1]
+            print("Processing Tableau report:", report_name)
+            try:
+                # process_tableau_reports scans a folder, so pass the folder
+                twb_folder = str(Path(twb_path).parent)
+                twb_result = _twb.process_tableau_reports(twb_folder)
+                twb_charts = twb_result.get("charts", [])
+                twb_meta = twb_result.get("metadata", [])
+                all_charts.extend(twb_charts)
+                metadata_visuals.extend(twb_meta)
+                total_visuals_seen += len(twb_charts) + len(twb_meta)
+            except Exception as twb_err:
+                print(f"Tableau extraction error for {report_name}: {twb_err}")
+            continue
+
+        # --------------------------------------------------
+        # POWER BI: PBIX
+        # --------------------------------------------------
         pbix_path = os.path.join(report_folder, f"{report_name}.pbix")
 
         if not os.path.exists(pbix_path):
@@ -1419,27 +1442,38 @@ Return JSON only.
             try:
                 response = generate_content_with_model_fallback(
                     client=client,
-                    model="gemini-2.5-flash",
+                    model="gemini-3.1-flash-lite",
                     contents=[selected_prompt],
                     api_key=API_KEY,
                 )
 
                 text = response.text.strip()
 
-                if text.startswith("```json"):
-                    text = text[7:]
-
-                if text.endswith("```"):
-                    text = text[:-3]
-
-                text = text.strip()
-
+                # Robust JSON extraction: handles markdown fences and
+                # conversational text surrounding the JSON block
                 try:
-                    return json.loads(text)
+                    clean = text
+                    if "```json" in clean:
+                        clean = clean[clean.find("```json") + 7:]
+                        clean = clean[:clean.rfind("```")]
+                    elif clean.startswith("```"):
+                        clean = clean[3:]
+                        if clean.endswith("```"):
+                            clean = clean[:-3]
+
+                    clean = clean.strip()
+
+                    # Extract outermost { ... } block
+                    start = clean.find("{")
+                    end = clean.rfind("}") + 1
+                    if start != -1 and end > start:
+                        clean = clean[start:end]
+
+                    return json.loads(clean)
                 except Exception:
                     return {
-                        "response_type":"explanation",
-                        "text":text
+                        "response_type": "explanation",
+                        "text": text
                     }
 
             except Exception as e:
@@ -1515,7 +1549,7 @@ Do not return JSON, just return professional formatting in markdown.
     for attempt in range(max_retries):
         try:
             response = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model="gemini-3.1-flash-lite",
                 contents=[prompt]
             )
             return response.text.strip()
